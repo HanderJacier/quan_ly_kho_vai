@@ -1,6 +1,32 @@
 import { NextResponse } from 'next/server';
 import { db } from '@/lib/db';
 
+export async function GET() {
+  try {
+    const [rows] = await db.query(`
+      SELECT 
+        e.export_id,
+        e.order_no,
+        e.export_type,
+        e.order_date,
+        e.status,
+        e.note,
+        c.customer_name,
+        COUNT(d.detail_id) AS total_rolls,
+        SUM(d.quantity) AS total_quantity
+      FROM export_orders e
+      LEFT JOIN customers c ON e.customer_id = c.customer_id
+      LEFT JOIN export_details d ON e.export_id = d.export_id
+      GROUP BY e.export_id
+      ORDER BY e.order_date DESC
+    `);
+
+    return NextResponse.json({ success: true, data: rows });
+  } catch (error: any) {
+    return NextResponse.json({ success: false, error: error.message }, { status: 500 });
+  }
+}
+
 export async function POST(request: Request) {
   const connection = await db.getConnection();
 

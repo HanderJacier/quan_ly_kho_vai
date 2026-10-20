@@ -1,6 +1,29 @@
 import { NextResponse } from 'next/server';
 import { db } from '@/lib/db';
 
+export async function GET() {
+  try {
+    const [rows] = await db.query(`
+      SELECT 
+        c.cutting_id,
+        c.cutting_date,
+        c.cut_quantity,
+        c.remaining_quantity,
+        c.note,
+        r.roll_code AS parent_roll_code,
+        f.fabric_name
+      FROM cutting_orders c
+      JOIN fabric_rolls r ON c.roll_id = r.roll_id
+      JOIN fabrics f ON r.fabric_id = f.fabric_id
+      ORDER BY c.cutting_date DESC
+    `);
+
+    return NextResponse.json({ success: true, data: rows });
+  } catch (error: any) {
+    return NextResponse.json({ success: false, error: error.message }, { status: 500 });
+  }
+}
+
 export async function POST(request: Request) {
   const connection = await db.getConnection();
 
