@@ -13,11 +13,18 @@ export async function GET() {
         e.note,
         c.customer_name,
         COUNT(d.detail_id) AS total_rolls,
-        SUM(d.quantity) AS total_quantity
+        COALESCE(SUM(d.quantity), 0) AS total_quantity
       FROM export_orders e
       LEFT JOIN customers c ON e.customer_id = c.customer_id
       LEFT JOIN export_details d ON e.export_id = d.export_id
-      GROUP BY e.export_id
+      GROUP BY 
+        e.export_id,
+        e.order_no,
+        e.export_type,
+        e.order_date,
+        e.status,
+        e.note,
+        c.customer_name
       ORDER BY e.order_date DESC
     `);
 
