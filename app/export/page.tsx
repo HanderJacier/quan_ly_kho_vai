@@ -61,7 +61,7 @@ export default function ExportPage() {
   const [historyEditForm, setHistoryEditForm] = useState({ quantity: '', note: '' });
   const [historySaving, setHistorySaving] = useState(false);
   const [historyEditError, setHistoryEditError] = useState('');
-  const [tableSelection, setTableSelection] = useState<'inventory' | 'history'>('inventory');
+  const [tableSelection, setTableSelection] = useState<'inventory' | 'history'>('history');
   const [tableMenuOpen, setTableMenuOpen] = useState(false);
 
   const [loading, setLoading] = useState(false);

@@ -1,6 +1,6 @@
 'use client';
 
-import { useState, useEffect, Suspense } from 'react';
+import { useState, useEffect, Suspense, useCallback, useRef } from 'react';
 import { useSearchParams } from 'next/navigation';
 import { Search, AlertTriangle, Filter, RefreshCw, ChevronLeft, ChevronRight, Archive, Pencil, Save, X } from 'lucide-react';
 import { FabricRoll, MasterItem } from '@/lib/types';
@@ -57,9 +57,12 @@ function InventoryContent() {
   const [editForm, setEditForm] = useState<RollEditForm | null>(null);
   const [saving, setSaving] = useState(false);
   const [notice, setNotice] = useState<{ type: 'success' | 'error'; text: string } | null>(null);
+  const inventoryRequestId = useRef(0);
 
-  const fetchInventory = async (targetPage = page, searchTerm = appliedSearch) => {
+  const fetchInventory = useCallback(async (targetPage = page, searchTerm = appliedSearch) => {
+    const requestId = ++inventoryRequestId.current;
     setLoading(true);
+
     try {
       const params = new URLSearchParams({
         page: String(targetPage),
@@ -69,47 +72,31 @@ function InventoryContent() {
       if (statusFilter) params.set('status', statusFilter);
       if (includeArchived) params.set('includeArchived', 'true');
 
-      const res = await fetch(`/api/inventory?${params}`);
+      const res = await fetch(`/api/inventory?${params}`, { cache: 'no-store' });
       const json = await res.json();
-      if (json.success) {
+      if (!res.ok || !json.success) {
+        throw new Error(json.error || 'Không thể tải tồn kho.');
+      }
+
+      if (requestId === inventoryRequestId.current) {
         setRolls(json.data || []);
         setTotal(json.pagination?.total ?? json.data?.length ?? 0);
       }
     } catch (err) {
-      console.error('Lỗi tải tồn kho:', err);
+      if (requestId === inventoryRequestId.current) {
+        console.error('Lỗi tải tồn kho:', err);
+        setNotice({ type: 'error', text: err instanceof Error ? err.message : 'Không thể tải tồn kho.' });
+      }
     } finally {
-      setLoading(false);
+      if (requestId === inventoryRequestId.current) {
+        setLoading(false);
+      }
     }
-  };
+  }, [appliedSearch, includeArchived, page, pageSize, statusFilter]);
 
   useEffect(() => {
-    let cancelled = false;
-    const loadInventory = async () => {
-      try {
-        const params = new URLSearchParams({
-          page: String(page),
-          pageSize: String(pageSize),
-        });
-        if (appliedSearch.trim()) params.set('search', appliedSearch.trim());
-        if (statusFilter) params.set('status', statusFilter);
-        if (includeArchived) params.set('includeArchived', 'true');
-        const response = await fetch(`/api/inventory?${params}`);
-        const json = await response.json();
-        if (!response.ok || !json.success) throw new Error(json.error || 'Không thể tải tồn kho.');
-        if (!cancelled) {
-          setRolls(json.data || []);
-          setTotal(json.pagination?.total ?? json.data?.length ?? 0);
-        }
-      } catch (error) {
-        console.error('Lỗi tải tồn kho:', error);
-        if (!cancelled) setNotice({ type: 'error', text: error instanceof Error ? error.message : 'Không thể tải tồn kho.' });
-      } finally {
-        if (!cancelled) setLoading(false);
-      }
-    };
-    void loadInventory();
-    return () => { cancelled = true; };
-  }, [appliedSearch, statusFilter, includeArchived, page]);
+    void fetchInventory(page, appliedSearch);
+  }, [fetchInventory, page, appliedSearch]);
 
   useEffect(() => {
     Promise.all([

@@ -61,7 +61,7 @@ export default function CuttingPage() {
   const [historyTotal, setHistoryTotal] = useState(0);
   const [historySearch, setHistorySearch] = useState('');
   const [historyFetching, setHistoryFetching] = useState(false);
-  const [tableSelection, setTableSelection] = useState<'inventory' | 'history'>('inventory');
+  const [tableSelection, setTableSelection] = useState<'inventory' | 'history'>('history');
   const [tableMenuOpen, setTableMenuOpen] = useState(false);
   
   const [parentRollId, setParentRollId] = useState<string>('');
