@@ -1,85 +1,47 @@
 import { NextResponse } from 'next/server';
+import { randomUUID } from 'node:crypto';
 import { db } from '@/lib/db';
-
-export async function GET() {
-  try {
-    const [rows] = await db.query(`
-      SELECT 
-        e.export_id,
-        e.order_no,
-        e.export_type,
-        e.order_date,
-        e.status,
-        e.note,
-        c.customer_name,
-        COUNT(d.detail_id) AS total_rolls,
-        COALESCE(SUM(d.quantity), 0) AS total_quantity
-      FROM export_orders e
-      LEFT JOIN customers c ON e.customer_id = c.customer_id
-      LEFT JOIN export_details d ON e.export_id = d.export_id
-      GROUP BY 
-        e.export_id,
-        e.order_no,
-        e.export_type,
-        e.order_date,
-        e.status,
-        e.note,
-        c.customer_name
-      ORDER BY e.order_date DESC
-    `);
-
-    return NextResponse.json({ success: true, data: rows });
-  } catch (error: any) {
-    return NextResponse.json({ success: false, error: error.message }, { status: 500 });
-  }
-}
 
 export async function POST(request: Request) {
   const connection = await db.getConnection();
 
   try {
     const body = await request.json();
-    const { 
-      export_type = 'SALE', 
-      customer_id, 
-      reference_no, 
-      note, 
-      items // Mảng các cuộn vải xuất: [{ roll_id: 2, quantity: 20.5 }]
-    } = body;
+    const { items, note, customer_id } = body;
 
-    if (!items || !Array.isArray(items) || items.length === 0) {
+    const customerId = Number(customer_id);
+    if (!Array.isArray(items) || items.length === 0 || !Number.isSafeInteger(customerId) || customerId <= 0) {
       return NextResponse.json(
-        { success: false, error: 'Danh sách cuộn vải xuất (items) không được trống' },
+        { success: false, error: 'Vui lòng chọn khách hàng và danh sách cuộn xuất kho hợp lệ.' },
         { status: 400 }
       );
     }
 
-    // Bắt đầu Transaction để đảm bảo tính toàn vẹn dữ liệu
     await connection.beginTransaction();
-
-    // 1. Tạo mã đơn xuất tự động (VD: EXP-20261020-XXXX)
-    const orderNo = `EXP-${Date.now()}`;
-
-    // 2. Thêm mới bản ghi vào export_orders
-    const [exportResult]: any = await connection.query(
-      `INSERT INTO export_orders (order_no, export_type, customer_id, reference_no, note, status, order_date)
-       VALUES (?, ?, ?, ?, ?, 'COMPLETED', NOW())`,
-      [orderNo, export_type, customer_id || null, reference_no || null, note || null]
+    const [customers]: any = await connection.query(
+      'SELECT customer_id FROM customers WHERE customer_id = ? AND is_active = TRUE FOR UPDATE',
+      [customerId]
+    );
+    if (customers.length === 0) throw new Error('Không tìm thấy khách hàng đang hoạt động.');
+    const orderCode = `PX-${new Date().toISOString().slice(0, 10).replaceAll('-', '')}-${randomUUID().slice(0, 8).toUpperCase()}`;
+    const [orderResult]: any = await connection.query(
+      `INSERT INTO export_orders (order_no, export_type, customer_id, status, note)
+       VALUES (?, 'SALE', ?, 'COMPLETED', ?)`,
+      [orderCode, customerId, typeof note === 'string' ? note.trim() || null : null]
     );
 
-    const exportId = exportResult.insertId;
+    for (let i = 0; i < items.length; i++) {
+      const { roll_id, export_quantity } = items[i];
+      const qty = parseFloat(export_quantity);
 
-    // 3. Duyệt qua từng cuộn vải để xuất
-    for (const item of items) {
-      const { roll_id, quantity } = item;
-
-      if (!roll_id || !quantity || quantity <= 0) {
-        throw new Error(`Thông tin roll_id hoặc quantity không hợp lệ`);
+      if (!Number.isSafeInteger(Number(roll_id)) || Number(roll_id) <= 0 || !Number.isFinite(qty) || qty <= 0) {
+        throw new Error(`Dòng thứ ${i + 1}: Thông tin cuộn vải hoặc số lượng xuất không hợp lệ.`);
       }
 
-      // Kiểm tra số lượng tồn kho thực tế
+      // 1. Khóa và lấy thông tin cuộn vải (FOR UPDATE)
       const [rolls]: any = await connection.query(
-        `SELECT quantity_remaining FROM fabric_rolls WHERE roll_id = ? FOR UPDATE`,
+        `SELECT roll_id, roll_code, location_id, quantity_remaining, stock_type
+         FROM fabric_rolls WHERE roll_id = ? AND is_archived = 0 FOR UPDATE`,
         [roll_id]
       );
 
@@ -87,46 +49,52 @@ export async function POST(request: Request) {
         throw new Error(`Không tìm thấy cuộn vải ID: ${roll_id}`);
       }
 
-      const currentQty = parseFloat(rolls[0].quantity_remaining);
-      if (currentQty < quantity) {
-        throw new Error(`Cuộn ID ${roll_id} chỉ còn ${currentQty}, không đủ để xuất ${quantity}`);
+      const currentRoll = rolls[0];
+      const currentQty = parseFloat(currentRoll.quantity_remaining);
+
+      if (qty > currentQty) {
+        throw new Error(`Cuộn ${currentRoll.roll_code}: Số lượng xuất (${qty}) vượt quá tồn kho hiện tại (${currentQty}).`);
       }
 
-      // Lưu vào export_details
-      await connection.query(
-        `INSERT INTO export_details (export_id, roll_id, quantity) VALUES (?, ?, ?)`,
-        [exportId, roll_id, quantity]
-      );
-
-      // Cập nhật số lượng còn lại trong fabric_rolls
-      const newQty = currentQty - quantity;
+      const newQty = currentQty - qty;
       const newStatus = newQty === 0 ? 'OUT_OF_STOCK' : 'ACTIVE';
 
+      // 2. Trừ tồn kho & cập nhật trạng thái
       await connection.query(
-        `UPDATE fabric_rolls 
-         SET quantity_remaining = ?, status = ? 
-         WHERE roll_id = ?`,
+        `UPDATE fabric_rolls SET quantity_remaining = ?, status = ? WHERE roll_id = ?`,
         [newQty, newStatus, roll_id]
+      );
+
+      // 3. Ghi log giao dịch theo enum của schema.
+      await connection.query(
+        `INSERT INTO inventory_transactions
+          (roll_id, transaction_type, quantity, from_location_id, to_location_id, reference_type, reference_id, note, transaction_date)
+         VALUES (?, 'OUTBOUND', ?, ?, NULL, 'EXPORT_ORDER', ?, ?, NOW())`,
+        [
+          roll_id,
+          qty,
+          currentRoll.location_id || null,
+          orderResult.insertId,
+          note || `Xuất kho hàng loạt cuộn ${currentRoll.roll_code}`,
+        ]
+      );
+      await connection.query(
+        `INSERT INTO export_details (export_id, roll_id, quantity, note)
+         VALUES (?, ?, ?, ?)`,
+        [orderResult.insertId, roll_id, qty, typeof note === 'string' ? note.trim() || null : null]
       );
     }
 
-    // Xác nhận hoàn tất Transaction
     await connection.commit();
 
     return NextResponse.json({
       success: true,
-      export_id: exportId,
-      order_no: orderNo,
-      message: 'Xuất kho thành công',
+      message: `Đã xuất kho thành công ${items.length} cuộn vải trong một Transaction.`,
+      data: { order_id: orderResult.insertId, order_code: orderCode },
     });
-
   } catch (error: any) {
-    // Nếu có lỗi, hoàn tác lại toàn bộ thao tác
     await connection.rollback();
-    return NextResponse.json(
-      { success: false, error: error.message },
-      { status: 500 }
-    );
+    return NextResponse.json({ success: false, error: error.message }, { status: 500 });
   } finally {
     connection.release();
   }

@@ -1,0 +1,3 @@
+ALTER TABLE fabric_rolls
+  ADD COLUMN IF NOT EXISTS lot_code VARCHAR(100) NULL AFTER roll_code,
+  ADD COLUMN IF NOT EXISTS supplier_name VARCHAR(160) NULL AFTER barcode;

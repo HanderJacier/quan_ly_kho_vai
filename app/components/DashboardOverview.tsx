@@ -7,41 +7,49 @@ import Link from 'next/link';
 interface InventoryItem {
   roll_id: number;
   roll_code: string;
-  fabric_name: string;
-  color_name: string;
-  current_quantity: string;
-  unit_name: string;
+  fabric_name: string | null;
+  color_name: string | null;
+  current_quantity: string | number;
+  unit_name: string | null;
   days_in_stock: number;
-  location_name: string;
-  shelf_name: string;
-  warehouse_name: string;
+  location_name: string | null;
+}
+
+interface DashboardData {
+  totalRolls: number;
+  quantitiesByUnit: { unitName: string; quantity: number }[];
+  agingRolls: number;
+  uniqueLocations: number;
+  latestRolls: InventoryItem[];
 }
 
 export default function DashboardOverview() {
-  const [items, setItems] = useState<InventoryItem[]>([]);
+  const [data, setData] = useState<DashboardData>({
+    totalRolls: 0,
+    quantitiesByUnit: [],
+    agingRolls: 0,
+    uniqueLocations: 0,
+    latestRolls: [],
+  });
   const [loading, setLoading] = useState(true);
 
   useEffect(() => {
-    async function fetchInventory() {
+    async function fetchDashboard() {
       try {
-        const res = await fetch('/api/inventory');
+        const res = await fetch('/api/dashboard');
         const json = await res.json();
-        if (json.success) {
-          setItems(json.data || []);
+        if (!res.ok || !json.success) {
+          throw new Error(json.error || 'Không thể tải dữ liệu tổng quan.');
         }
+        setData(json.data);
       } catch (err) {
-        console.error('Lỗi lấy dữ liệu tồn kho:', err);
+        console.error('Lỗi lấy dữ liệu tổng quan:', err);
       } finally {
         setLoading(false);
       }
     }
-    fetchInventory();
+    fetchDashboard();
   }, []);
-
-  const totalRolls = items.length;
-  const totalMeters = items.reduce((acc, item) => acc + (parseFloat(item.current_quantity) || 0), 0);
-  const agingRolls = items.filter((item) => item.days_in_stock > 730).length;
-  const uniqueLocations = new Set(items.map((i) => i.location_name).filter(Boolean)).size;
 
   return (
     <div className="space-y-6">
@@ -57,7 +65,7 @@ export default function DashboardOverview() {
           <div>
             <p className="text-xs font-semibold text-slate-500 uppercase tracking-wider">Tổng số cuộn</p>
             <h3 className="text-2xl font-bold text-slate-900 mt-1">
-              {loading ? '...' : totalRolls.toLocaleString('vi-VN')}
+              {loading ? '...' : data.totalRolls.toLocaleString('vi-VN')}
             </h3>
             <span className="text-xs text-slate-500 mt-1 block">Cuộn vải đang lưu kho</span>
           </div>
@@ -68,11 +76,21 @@ export default function DashboardOverview() {
 
         <div className="bg-white p-5 rounded-2xl border border-slate-200 shadow-xs flex items-center justify-between">
           <div>
-            <p className="text-xs font-semibold text-slate-500 uppercase tracking-wider">Tổng sản lượng</p>
-            <h3 className="text-2xl font-bold text-slate-900 mt-1">
-              {loading ? '...' : `${totalMeters.toLocaleString('vi-VN')} m`}
-            </h3>
-            <span className="text-xs text-slate-500 mt-1 block">Tổng mét vải thực tế</span>
+            <p className="text-xs font-semibold text-slate-500 uppercase tracking-wider">Tồn kho theo đơn vị</p>
+            {loading ? (
+              <h3 className="text-2xl font-bold text-slate-900 mt-1">...</h3>
+            ) : data.quantitiesByUnit.length > 0 ? (
+              <div className="mt-1 space-y-0.5">
+                {data.quantitiesByUnit.map((item) => (
+                  <p key={item.unitName} className="text-sm font-bold text-slate-900">
+                    {item.quantity.toLocaleString('vi-VN')} {item.unitName}
+                  </p>
+                ))}
+              </div>
+            ) : (
+              <h3 className="text-2xl font-bold text-slate-900 mt-1">0</h3>
+            )}
+            <span className="text-xs text-slate-500 mt-1 block">Không cộng gộp khác đơn vị</span>
           </div>
           <div className="w-12 h-12 rounded-xl bg-emerald-50 border border-emerald-100 flex items-center justify-center text-emerald-600">
             <Layers className="w-6 h-6" />
@@ -82,12 +100,12 @@ export default function DashboardOverview() {
         <div className="bg-white p-5 rounded-2xl border border-slate-200 shadow-xs flex items-center justify-between">
           <div>
             <p className="text-xs font-semibold text-slate-500 uppercase tracking-wider">Tồn lâu (&gt; 2 năm)</p>
-            <h3 className={`text-2xl font-bold mt-1 ${agingRolls > 0 ? 'text-amber-600' : 'text-slate-900'}`}>
-              {loading ? '...' : `${agingRolls} cuộn`}
+            <h3 className={`text-2xl font-bold mt-1 ${data.agingRolls > 0 ? 'text-amber-600' : 'text-slate-900'}`}>
+              {loading ? '...' : `${data.agingRolls} cuộn`}
             </h3>
             <span className="text-xs text-slate-500 mt-1 block">Cần ưu tiên xuất trước</span>
           </div>
-          <div className={`w-12 h-12 rounded-xl flex items-center justify-center ${agingRolls > 0 ? 'bg-amber-50 border border-amber-100 text-amber-600' : 'bg-slate-50 border border-slate-100 text-slate-400'}`}>
+          <div className={`w-12 h-12 rounded-xl flex items-center justify-center ${data.agingRolls > 0 ? 'bg-amber-50 border border-amber-100 text-amber-600' : 'bg-slate-50 border border-slate-100 text-slate-400'}`}>
             <AlertTriangle className="w-6 h-6" />
           </div>
         </div>
@@ -96,7 +114,7 @@ export default function DashboardOverview() {
           <div>
             <p className="text-xs font-semibold text-slate-500 uppercase tracking-wider">Vị trí Kệ sử dụng</p>
             <h3 className="text-2xl font-bold text-slate-900 mt-1">
-              {loading ? '...' : `${uniqueLocations} vị trí`}
+              {loading ? '...' : `${data.uniqueLocations} vị trí`}
             </h3>
             <span className="text-xs text-slate-500 mt-1 block">Đang chứa hàng</span>
           </div>
@@ -122,7 +140,7 @@ export default function DashboardOverview() {
 
         {loading ? (
           <div className="py-8 text-center text-sm text-slate-400">Đang tải dữ liệu kho...</div>
-        ) : items.length === 0 ? (
+        ) : data.latestRolls.length === 0 ? (
           <div className="py-8 text-center text-sm text-slate-400">Chưa có dữ liệu tồn kho</div>
         ) : (
           <div className="overflow-x-auto">
@@ -138,13 +156,13 @@ export default function DashboardOverview() {
                 </tr>
               </thead>
               <tbody className="divide-y divide-slate-100">
-                {items.slice(0, 5).map((item) => (
+                {data.latestRolls.map((item) => (
                   <tr key={item.roll_id} className="hover:bg-slate-50/80 transition-colors">
                     <td className="py-3 px-4 font-semibold text-slate-900">{item.roll_code}</td>
                     <td className="py-3 px-4 text-slate-700">{item.fabric_name}</td>
                     <td className="py-3 px-4 text-slate-600">{item.color_name || '-'}</td>
                     <td className="py-3 px-4 text-right font-medium text-slate-900">
-                      {parseFloat(item.current_quantity).toLocaleString('vi-VN')} {item.unit_name || 'm'}
+                      {Number(item.current_quantity).toLocaleString('vi-VN')} {item.unit_name || 'm'}
                     </td>
                     <td className="py-3 px-4 text-slate-600">
                       <span className="inline-flex items-center px-2.5 py-0.5 rounded-md text-xs font-medium bg-slate-100 text-slate-700 border border-slate-200">
