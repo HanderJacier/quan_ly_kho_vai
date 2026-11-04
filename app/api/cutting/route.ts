@@ -23,6 +23,8 @@ interface CuttingHistoryRow extends RowDataPacket {
   used_quantity: string;
   returned_quantity: string;
   saving_quantity: string;
+  additional_remnant_note: string | null;
+  additional_saving_note: string | null;
 }
 
 interface CuttingCountRow extends RowDataPacket {
@@ -43,6 +45,15 @@ interface ParentRollRow extends RowDataPacket {
   inbound_date: Date | string | null;
   expiry_date: Date | string | null;
   stock_type: string | null;
+  status: 'ACTIVE' | 'EXPIRED' | 'OUT_OF_STOCK';
+}
+
+interface AdditionalCutRollRow extends RowDataPacket {
+  roll_id: number;
+  roll_code: string;
+  stock_type: string | null;
+  quantity_remaining: string;
+  location_id: number | null;
   status: 'ACTIVE' | 'EXPIRED' | 'OUT_OF_STOCK';
 }
 
@@ -172,6 +183,24 @@ export async function GET(request: Request) {
         ${hasUsedQuantity ? 'c.used_quantity' : 'c.cut_quantity'} AS used_quantity,
         ${hasReturnedQuantity ? 'c.returned_quantity' : '0'} AS returned_quantity,
         ${hasSavingQuantity ? 'c.saving_quantity' : '0'} AS saving_quantity,
+        (
+          SELECT GROUP_CONCAT(it.note ORDER BY it.trans_id SEPARATOR '; ')
+          FROM inventory_transactions it
+          WHERE it.reference_type = 'CUTTING_ORDER'
+            AND it.reference_id = c.cutting_id
+            AND it.transaction_type = 'CUTTING'
+            AND it.roll_id <> c.roll_id
+            AND it.note LIKE 'Lấy % từ đầu khúc cuộn %'
+        ) AS additional_remnant_note,
+        (
+          SELECT GROUP_CONCAT(it.note ORDER BY it.trans_id SEPARATOR '; ')
+          FROM inventory_transactions it
+          WHERE it.reference_type = 'CUTTING_ORDER'
+            AND it.reference_id = c.cutting_id
+            AND it.transaction_type = 'CUTTING'
+            AND it.roll_id <> c.roll_id
+            AND it.note LIKE 'Lấy % từ vải tiết kiệm cuộn %'
+        ) AS additional_saving_note,
         f.fabric_name,
         color.color_name
       ${fromSql}
@@ -217,8 +246,10 @@ export async function POST(request: Request) {
 
   const values = body as Record<string, unknown>;
   const parentRollId = Number(values.parent_roll_id);
-  const issuedQty = Number(values.issued_quantity ?? values.cut_quantity);
+  const rawIssuedQty = values.issued_quantity ?? values.cut_quantity;
+  const issuedQty = rawIssuedQty === '' || rawIssuedQty === null ? 0 : Number(rawIssuedQty);
   const note = typeof values.note === 'string' ? values.note.trim() : '';
+  const additionalRolls = values.additional_rolls;
 
   const validQuantity = (quantity: number) => Number.isFinite(quantity)
     && quantity >= 0
@@ -226,11 +257,41 @@ export async function POST(request: Request) {
   if (!Number.isSafeInteger(parentRollId) || parentRollId <= 0) {
     return NextResponse.json({ success: false, error: 'Cuộn vải gốc không hợp lệ.' }, { status: 400 });
   }
-  if (!validQuantity(issuedQty) || issuedQty <= 0) {
+  if (!validQuantity(issuedQty) || issuedQty < 0) {
     return NextResponse.json(
-      { success: false, error: 'Số lượng mang ra phải lớn hơn 0, tối đa 3 chữ số thập phân.' },
+      { success: false, error: 'Số lượng mang ra phải không âm, tối đa 3 chữ số thập phân.' },
       { status: 400 }
     );
+  }
+  if (additionalRolls !== undefined && !Array.isArray(additionalRolls)) {
+    return NextResponse.json({ success: false, error: 'Danh sách cuộn đầu khúc/tiết kiệm không hợp lệ.' }, { status: 400 });
+  }
+  const requestedAdditionalRolls = (Array.isArray(additionalRolls) ? additionalRolls : []).map((item) => {
+    if (!item || typeof item !== 'object') return null;
+    const additional = item as Record<string, unknown>;
+    const rollId = Number(additional.roll_id);
+    const quantity = Number(additional.quantity);
+    const stockType = additional.stock_type;
+    if (
+      !Number.isSafeInteger(rollId) || rollId <= 0 || rollId === parentRollId
+      || !validQuantity(quantity) || quantity <= 0
+      || (stockType !== 'REMNANT' && stockType !== 'SAVING')
+    ) return null;
+    return { roll_id: rollId, quantity, stock_type: stockType };
+  });
+  const validAdditionalRolls = requestedAdditionalRolls.filter(
+    (item): item is NonNullable<typeof item> => item !== null
+  );
+  if (
+    validAdditionalRolls.length > 2
+    || validAdditionalRolls.length !== requestedAdditionalRolls.length
+    || new Set(validAdditionalRolls.map((item) => item.roll_id)).size !== validAdditionalRolls.length
+    || new Set(validAdditionalRolls.map((item) => item.stock_type)).size !== validAdditionalRolls.length
+  ) {
+    return NextResponse.json({ success: false, error: 'Mỗi phân loại chỉ được chọn một cuộn đầu khúc hoặc tiết kiệm hợp lệ.' }, { status: 400 });
+  }
+  if (issuedQty === 0 && validAdditionalRolls.length === 0) {
+    return NextResponse.json({ success: false, error: 'Nhập số lượng mang ra hoặc chọn cuộn đầu khúc/tiết kiệm để lấy.' }, { status: 400 });
   }
 
   let connection: PoolConnection | undefined;
@@ -258,7 +319,10 @@ export async function POST(request: Request) {
     }
 
     const parentQty = Number(parent.quantity_remaining);
-    if (!Number.isFinite(parentQty) || parentQty <= 0 || parent.status === 'OUT_OF_STOCK') {
+    if (!Number.isFinite(parentQty) || parentQty < 0) {
+      throw new CuttingRequestError('Tồn kho cuộn mẹ hiện không hợp lệ.', 409);
+    }
+    if (issuedQty > 0 && (parentQty <= 0 || parent.status === 'OUT_OF_STOCK')) {
       throw new CuttingRequestError('Cuộn vải gốc không còn tồn kho để cắt.', 409);
     }
 
@@ -269,43 +333,119 @@ export async function POST(request: Request) {
       );
     }
 
+    let lockedAdditionalRolls: AdditionalCutRollRow[] = [];
+    if (validAdditionalRolls.length > 0) {
+      const sortedRollIds = validAdditionalRolls.map((item) => item.roll_id).sort((a, b) => a - b);
+      const [additionalRows] = await transactionConnection.query<AdditionalCutRollRow[]>(
+        `SELECT roll_id, roll_code, stock_type, quantity_remaining, location_id, status
+         FROM fabric_rolls
+         WHERE roll_id IN (${sortedRollIds.map(() => '?').join(', ')}) AND is_archived = 0
+         ORDER BY roll_id
+         FOR UPDATE`,
+        sortedRollIds
+      );
+      lockedAdditionalRolls = additionalRows;
+      for (const requested of validAdditionalRolls) {
+        const roll = lockedAdditionalRolls.find((item) => item.roll_id === requested.roll_id);
+        if (!roll) {
+          throw new CuttingRequestError('Không tìm thấy cuộn đầu khúc/tiết kiệm đã chọn.', 404);
+        }
+        if (roll.stock_type !== requested.stock_type) {
+          throw new CuttingRequestError(`Cuộn ${roll.roll_code} không thuộc đúng phân loại đã chọn. Tải lại danh sách rồi thử lại.`, 409);
+        }
+        if (roll.roll_code !== parent.roll_code) {
+          throw new CuttingRequestError(`Cuộn lấy thêm phải có cùng mã với cuộn mẹ (${parent.roll_code}).`, 400);
+        }
+        const quantityRemaining = Number(roll.quantity_remaining);
+        if (!Number.isFinite(quantityRemaining) || quantityRemaining <= 0 || roll.status === 'OUT_OF_STOCK') {
+          throw new CuttingRequestError(`Cuộn ${roll.roll_code} đã hết tồn kho.`, 409);
+        }
+        if (requested.quantity > quantityRemaining) {
+          throw new CuttingRequestError(
+            `Số lượng lấy từ cuộn ${roll.roll_code} (${requested.quantity}m) vượt quá tồn hiện tại (${quantityRemaining}m).`,
+            400
+          );
+        }
+      }
+    }
+
     const newParentQty = Number((parentQty - issuedQty).toFixed(3));
-    await transactionConnection.query(
-      `UPDATE fabric_rolls SET quantity_remaining = ?, status = ? WHERE roll_id = ?`,
-      [newParentQty, newParentQty === 0 ? 'OUT_OF_STOCK' : parent.status, parentRollId]
-    );
+    if (issuedQty > 0) {
+      await transactionConnection.query(
+        `UPDATE fabric_rolls SET quantity_remaining = ?, status = ? WHERE roll_id = ?`,
+        [newParentQty, newParentQty === 0 ? 'OUT_OF_STOCK' : parent.status, parentRollId]
+      );
+    }
 
     const [cuttingResult] = await transactionConnection.query<ResultSetHeader>(
       `INSERT INTO cutting_orders (
         roll_id, child_roll_id, saving_roll_id, cut_quantity, used_quantity,
         returned_quantity, saving_quantity, remaining_quantity, note, cutting_date, return_completed_at
       ) VALUES (?, NULL, NULL, ?, 0, 0, 0, ?, ?, NOW(), NULL)`,
-      [parentRollId, issuedQty, newParentQty, note || `Mang ra ${issuedQty}m để cắt từ cuộn ${parent.roll_code}`]
-    );
-
-    await transactionConnection.query(
-      `INSERT INTO inventory_transactions
-        (roll_id, transaction_type, quantity, from_location_id, to_location_id, reference_type, reference_id, note, transaction_date)
-       VALUES (?, 'CUTTING', ?, ?, ?, 'CUTTING_ORDER', ?, ?, NOW())`,
       [
         parentRollId,
         issuedQty,
-        parent.location_id,
-        parent.location_id,
-        cuttingResult.insertId,
-        note || `Mang ra ${issuedQty}m để cắt từ cuộn ${parent.roll_code}`,
+        newParentQty,
+        note || (issuedQty > 0
+          ? `Mang ra ${issuedQty}m để cắt từ cuộn ${parent.roll_code}`
+          : `Chỉ lấy đầu khúc/tiết kiệm cùng mã ${parent.roll_code}`),
       ]
     );
+
+    if (issuedQty > 0) {
+      await transactionConnection.query(
+        `INSERT INTO inventory_transactions
+          (roll_id, transaction_type, quantity, from_location_id, to_location_id, reference_type, reference_id, note, transaction_date)
+         VALUES (?, 'CUTTING', ?, ?, ?, 'CUTTING_ORDER', ?, ?, NOW())`,
+        [
+          parentRollId,
+          issuedQty,
+          parent.location_id,
+          parent.location_id,
+          cuttingResult.insertId,
+          note || `Mang ra ${issuedQty}m để cắt từ cuộn ${parent.roll_code}`,
+        ]
+      );
+    }
+
+    for (const requested of validAdditionalRolls) {
+      const roll = lockedAdditionalRolls.find((item) => item.roll_id === requested.roll_id);
+      if (!roll) throw new CuttingRequestError('Không tìm thấy cuộn đầu khúc/tiết kiệm đã chọn.', 404);
+      const newQuantity = Number((Number(roll.quantity_remaining) - requested.quantity).toFixed(3));
+      await transactionConnection.query(
+        `UPDATE fabric_rolls SET quantity_remaining = ?, status = ? WHERE roll_id = ?`,
+        [newQuantity, newQuantity === 0 ? 'OUT_OF_STOCK' : roll.status, roll.roll_id]
+      );
+      await transactionConnection.query(
+        `INSERT INTO inventory_transactions
+          (roll_id, transaction_type, quantity, from_location_id, to_location_id, reference_type, reference_id, note, transaction_date)
+         VALUES (?, 'CUTTING', ?, ?, ?, 'CUTTING_ORDER', ?, ?, NOW())`,
+        [
+          roll.roll_id,
+          requested.quantity,
+          roll.location_id,
+          roll.location_id,
+          cuttingResult.insertId,
+          `Lấy ${requested.quantity}m từ ${requested.stock_type === 'REMNANT' ? 'đầu khúc' : 'vải tiết kiệm'} cuộn ${roll.roll_code} cho lần cắt #${cuttingResult.insertId}`,
+        ]
+      );
+    }
 
     await transactionConnection.commit();
     transactionStarted = false;
 
     return NextResponse.json({
       success: true,
-      message: `Đã ghi nhận mang ra ${issuedQty}m. Khi hoàn thành, hãy nhập số mét thực tế còn lại và phân loại vải trả về.`,
+      message: issuedQty > 0
+        ? `Đã ghi nhận mang ra ${issuedQty}m${validAdditionalRolls.length ? ` và lấy thêm ${validAdditionalRolls.reduce((sum, item) => sum + item.quantity, 0)}m từ cuộn đầu khúc/tiết kiệm đã chọn` : ''}.`
+        : `Đã ghi nhận lấy ${validAdditionalRolls.reduce((sum, item) => sum + item.quantity, 0)}m từ cuộn đầu khúc/tiết kiệm đã chọn.`,
       data: {
         cutting_id: cuttingResult.insertId,
         parent_remaining_qty: newParentQty,
+        additional_rolls: validAdditionalRolls.map((item) => ({
+          roll_id: item.roll_id,
+          quantity_remaining: Number((Number(lockedAdditionalRolls.find((roll) => roll.roll_id === item.roll_id)?.quantity_remaining) - item.quantity).toFixed(3)),
+        })),
       },
     });
   } catch (error) {

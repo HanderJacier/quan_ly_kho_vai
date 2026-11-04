@@ -73,6 +73,7 @@ export default function ExportPage() {
   const [fetching, setFetching] = useState(true);
   const [message, setMessage] = useState<{ type: 'success' | 'error'; text: string } | null>(null);
   const selectedInventoryRoll = rolls.find((roll) => roll.roll_id === selectedInventoryRollId);
+  const initialSearchRender = useRef({ inventory: true, history: true });
 
   useEffect(() => {
     if (editingNoteIndex === null) return;
@@ -162,11 +163,6 @@ export default function ExportPage() {
     }
   };
 
-  const searchRolls = () => {
-    setPage(1);
-    fetchRolls(1);
-  };
-
   const changePage = (targetPage: number) => {
     setPage(targetPage);
     fetchRolls(targetPage);
@@ -178,6 +174,32 @@ export default function ExportPage() {
     fetchRolls();
     fetchExportHistory(1);
   }, []);
+
+  useEffect(() => {
+    if (initialSearchRender.current.inventory) {
+      initialSearchRender.current.inventory = false;
+      return;
+    }
+
+    const timeout = window.setTimeout(() => {
+      setPage(1);
+      void fetchRolls(1, rollSearch);
+    }, 300);
+    return () => window.clearTimeout(timeout);
+  }, [rollSearch]);
+
+  useEffect(() => {
+    if (initialSearchRender.current.history) {
+      initialSearchRender.current.history = false;
+      return;
+    }
+
+    const timeout = window.setTimeout(() => {
+      setHistoryPage(1);
+      void fetchExportHistory(1, historySearch);
+    }, 300);
+    return () => window.clearTimeout(timeout);
+  }, [historySearch]);
 
   useEffect(() => {
     fetch('/api/customers')
@@ -435,11 +457,6 @@ export default function ExportPage() {
   };
 
   const historyTotalPages = Math.ceil(historyTotal / pageSize);
-  const searchExportHistory = () => {
-    setHistoryPage(1);
-    void fetchExportHistory(1, historySearch);
-  };
-
   return (
     <div className="mx-auto max-w-screen-2xl space-y-4">
       <div className="flex flex-col gap-3 border border-slate-400 bg-gradient-to-b from-slate-100 to-slate-300 px-3 py-2 shadow-sm xl:flex-row xl:items-center xl:justify-between">
@@ -750,20 +767,11 @@ export default function ExportPage() {
                 <input
                   value={rollSearch}
                   onChange={(event) => setRollSearch(event.target.value)}
-                  onKeyDown={(event) => event.key === 'Enter' && searchRolls()}
                   placeholder="Tìm cuộn đã có..."
                   aria-label="Tìm cuộn tồn kho có thể xuất"
                   className="h-7 w-full min-w-0 border border-slate-400 bg-white pl-7 pr-2 text-[11px] text-slate-900 shadow-inner focus:border-blue-600 focus:outline-hidden focus:ring-1 focus:ring-blue-500"
                 />
               </div>
-              <button
-                type="button"
-                onClick={searchRolls}
-                disabled={fetching}
-                className="h-7 shrink-0 border border-slate-400 bg-gradient-to-b from-white to-slate-200 px-2 text-[11px] font-semibold text-slate-800 disabled:opacity-50"
-              >
-                Tìm
-              </button>
               <button
                 type="button"
                 onClick={() => fetchRolls()}
@@ -865,13 +873,11 @@ export default function ExportPage() {
                 <input
                   value={historySearch}
                   onChange={(event) => setHistorySearch(event.target.value)}
-                  onKeyDown={(event) => event.key === 'Enter' && searchExportHistory()}
                   placeholder="Tìm cuộn đã xuất..."
                   aria-label="Tìm lịch sử xuất kho"
                   className="h-7 w-full min-w-0 border border-slate-400 bg-white pl-7 pr-2 text-[11px] text-slate-900 shadow-inner focus:border-blue-600 focus:outline-hidden focus:ring-1 focus:ring-blue-500"
                 />
               </div>
-              <button type="button" onClick={searchExportHistory} disabled={historyLoading} className="h-7 shrink-0 border border-slate-400 bg-gradient-to-b from-white to-slate-200 px-2 text-[11px] font-semibold text-slate-800 disabled:opacity-50">Tìm</button>
               <button type="button" onClick={() => void fetchExportHistory()} disabled={historyLoading} className="inline-flex h-7 shrink-0 items-center gap-1 border border-slate-400 bg-gradient-to-b from-white to-slate-200 px-2 text-[11px] font-semibold text-slate-800 disabled:opacity-50">
                 <RefreshCw className={`h-3.5 w-3.5 ${historyLoading ? 'animate-spin' : ''}`} /> Làm mới
               </button>

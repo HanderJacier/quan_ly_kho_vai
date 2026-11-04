@@ -75,14 +75,22 @@ export async function POST(request: Request) {
       ) {
         throw new InboundValidationError(`Dòng thứ ${i + 1}: Độ dài vượt giới hạn (mã cuộn/mã lô 100, nhà cung cấp 160, barcode 150 ký tự).`);
       }
-      // 2. Kiểm tra trùng lặp roll_code hoặc barcode trong DB
+      // Mã cuộn có thể dùng lại giữa các phân loại, nhưng không được trùng cùng phân loại.
       const [existing] = await connection.query<RowDataPacket[]>(
-        `SELECT roll_id FROM fabric_rolls WHERE roll_code = ? OR (barcode IS NOT NULL AND barcode = ? AND barcode != '')`,
-        [roll_code, barcode || '']
+        `SELECT roll_id, roll_code = ? AND stock_type = ? AS duplicate_roll
+         FROM fabric_rolls
+         WHERE (roll_code = ? AND stock_type = ?)
+           OR (barcode IS NOT NULL AND barcode = ? AND barcode != '')`,
+        [roll_code, stockType, roll_code, stockType, barcode || '']
       );
 
       if (existing.length > 0) {
-        throw new InboundValidationError(`Dòng thứ ${i + 1}: Mã cuộn "${roll_code}" hoặc Barcode đã tồn tại trong hệ thống.`);
+        const duplicateRoll = existing.some((row) => Boolean(row.duplicate_roll));
+        throw new InboundValidationError(
+          duplicateRoll
+            ? `Dòng thứ ${i + 1}: Mã cuộn "${roll_code}" đã tồn tại với cùng phân loại tồn kho.`
+            : `Dòng thứ ${i + 1}: Barcode đã tồn tại trong hệ thống.`
+        );
       }
 
       const barcodeValue = barcode || `BC-${randomUUID()}`;

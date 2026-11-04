@@ -22,6 +22,7 @@ export async function GET(request: Request) {
     ]);
     const { searchParams } = new URL(request.url);
     const search = searchParams.get('search') || '';
+    const exactRollCode = searchParams.get('exactRollCode')?.trim() || '';
     const status = searchParams.get('status') || '';
     const stockType = searchParams.get('stockType') || '';
     const includeArchived = searchParams.get('includeArchived') === 'true';
@@ -53,6 +54,11 @@ export async function GET(request: Request) {
     `;
     const conditions: string[] = includeArchived ? [] : ['r.is_archived = 0'];
     const params: (string | number)[] = [];
+
+    if (exactRollCode) {
+      conditions.push('r.roll_code = ?');
+      params.push(exactRollCode);
+    }
 
     if (search) {
       const wildcard = `%${search}%`;
@@ -86,6 +92,9 @@ export async function GET(request: Request) {
 
     if (stockType) {
       if (stockType === 'SAVING') {
+        conditions.push('r.stock_type = ?');
+        params.push(stockType);
+      } else if (stockType === 'REMNANT') {
         conditions.push('r.stock_type = ?');
         params.push(stockType);
       } else if (stockType === 'REGULAR') {
@@ -254,14 +263,23 @@ export async function PATCH(request: Request) {
       return NextResponse.json({ success: false, error: 'Không tìm thấy cuộn hoặc cuộn đã được lưu trữ.' }, { status: 404 });
     }
 
-    const [existing] = await connection.query(
-      'SELECT roll_id FROM fabric_rolls WHERE roll_id <> ? AND (roll_code = ? OR (? <> "" AND barcode = ?)) LIMIT 1',
-      [rollId, rollCode, barcode, barcode]
+    const [existing] = await connection.query<RowDataPacket[]>(
+      `SELECT roll_id, roll_code = ? AND stock_type = ? AS duplicate_roll
+       FROM fabric_rolls
+       WHERE roll_id <> ?
+         AND ((roll_code = ? AND stock_type = ?) OR (? <> '' AND barcode = ?))
+       LIMIT 1`,
+      [rollCode, stockType, rollId, rollCode, stockType, barcode, barcode]
     );
-    if (Array.isArray(existing) && existing.length > 0) {
+    if (existing.length > 0) {
       await connection.rollback();
       transactionStarted = false;
-      return NextResponse.json({ success: false, error: 'Mã cuộn hoặc barcode đã được sử dụng.' }, { status: 409 });
+      return NextResponse.json({
+        success: false,
+        error: existing[0].duplicate_roll
+          ? 'Mã cuộn đã được sử dụng với cùng phân loại tồn kho.'
+          : 'Barcode đã được sử dụng.',
+      }, { status: 409 });
     }
 
     await connection.query(
