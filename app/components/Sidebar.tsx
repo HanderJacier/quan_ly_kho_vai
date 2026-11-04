@@ -29,6 +29,11 @@ const navItems = [
     icon: PackagePlus,
   },
   {
+    name: 'Xuất kho vải',
+    href: '/export',
+    icon: PackageMinus,
+  },
+  {
     name: 'Cắt vải & Tách cuộn',
     href: '/cutting',
     icon: Scissors,
@@ -37,11 +42,6 @@ const navItems = [
     name: 'Đổi vị trí kệ',
     href: '/locations/transfer',
     icon: ArrowLeftRight,
-  },
-  {
-    name: 'Xuất kho vải',
-    href: '/export',
-    icon: PackageMinus,
   },
 ];
 

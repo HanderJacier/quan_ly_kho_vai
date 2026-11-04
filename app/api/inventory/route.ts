@@ -55,11 +55,23 @@ export async function GET(request: Request) {
     const params: (string | number)[] = [];
 
     if (search) {
-      conditions.push(
-        '(r.roll_code LIKE ? OR r.barcode LIKE ? OR f.fabric_name LIKE ? OR c.color_name LIKE ? OR l.location_code LIKE ?)'
-      );
       const wildcard = `%${search}%`;
-      params.push(wildcard, wildcard, wildcard, wildcard, wildcard);
+      const searchConditions = [
+        'r.roll_code LIKE ?',
+        'r.barcode LIKE ?',
+        ...(hasLotCode ? ['r.lot_code LIKE ?'] : []),
+        ...(hasSupplierName ? ['r.supplier_name LIKE ?'] : []),
+        'f.fabric_name LIKE ?',
+        'c.color_name LIKE ?',
+        't.type_name LIKE ?',
+        'l.location_code LIKE ?',
+        'CONCAT_WS(\' / \', w.warehouse_code, s.shelf_code, l.location_code, l.floor_number, l.side) LIKE ?',
+        'u.unit_name LIKE ?',
+        'r.note LIKE ?',
+        'r.stock_type LIKE ?',
+      ];
+      conditions.push(`(${searchConditions.join(' OR ')})`);
+      params.push(...searchConditions.map(() => wildcard));
     }
 
     if (status) {

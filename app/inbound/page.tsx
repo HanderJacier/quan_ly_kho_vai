@@ -1,6 +1,7 @@
 'use client';
 
-import { useState, useEffect } from 'react';
+import { useState, useEffect, useCallback, useRef } from 'react';
+import { createPortal } from 'react-dom';
 import {
   PackagePlus,
   Plus,
@@ -9,18 +10,15 @@ import {
   AlertCircle,
   RefreshCw,
   Printer,
-  ChevronDown,
-  ChevronUp,
+  Copy,
   ChevronLeft,
   ChevronRight,
-  Table2,
   Pencil,
   Save,
   X,
 } from 'lucide-react';
 import { MasterItem } from '@/lib/types';
 import { createCatalogOption, type CatalogCreateKind } from '@/lib/catalog-client';
-import PageViewToggle, { type PageViewMode } from '../components/PageViewToggle';
 import SearchableCombobox from '../components/SearchableCombobox';
 import RollLabelPrinter, { type RollLabelData } from '../components/RollLabelPrinter';
 
@@ -75,6 +73,8 @@ interface InboundRow {
 const isStockType = (value: string): value is InboundRow['stock_type'] =>
   value === 'REGULAR' || value === 'REMNANT' || value === 'SAVING';
 
+const INVENTORY_PAGE_SIZE = 25;
+
 export default function InboundPage() {
   const [masterData, setMasterData] = useState<{
     fabrics: MasterItem[];
@@ -108,12 +108,19 @@ export default function InboundPage() {
       note: '',
     },
   ]);
-  const [expandedRowIndex, setExpandedRowIndex] = useState<number | null>(0);
+  const [selectedRowIndex, setSelectedRowIndex] = useState(0);
+  const [editingNoteIndex, setEditingNoteIndex] = useState<number | null>(null);
+  const [noteEditorPosition, setNoteEditorPosition] = useState<{ top: number; left: number; width: number } | null>(null);
+  const [inventorySearch, setInventorySearch] = useState('');
+  const noteEditorRef = useRef<HTMLDivElement>(null);
+  const noteTextareaRef = useRef<HTMLTextAreaElement>(null);
 
   const [inventory, setInventory] = useState<InventoryRoll[]>([]);
+  const [selectedInventoryRollId, setSelectedInventoryRollId] = useState<number | null>(null);
   const [inventoryTotal, setInventoryTotal] = useState(0);
   const [inventoryPage, setInventoryPage] = useState(1);
   const [inventoryLoading, setInventoryLoading] = useState(true);
+  const inventoryRequestId = useRef(0);
   const [editingInventoryRoll, setEditingInventoryRoll] = useState<InventoryRoll | null>(null);
   const [editInventoryForm, setEditInventoryForm] = useState({
     roll_code: '',
@@ -131,11 +138,57 @@ export default function InboundPage() {
     note: '',
   });
   const [savingInventoryEdit, setSavingInventoryEdit] = useState(false);
-  const [viewMode, setViewMode] = useState<PageViewMode>('both');
   const [loading, setLoading] = useState(false);
   const [fetching, setFetching] = useState(true);
   const [message, setMessage] = useState<{ type: 'success' | 'error'; text: string } | null>(null);
   const [labelToPrint, setLabelToPrint] = useState<RollLabelData[] | null>(null);
+  const selectedInventoryRoll = inventory.find((roll) => roll.roll_id === selectedInventoryRollId);
+
+  useEffect(() => {
+    if (editingNoteIndex === null) return;
+
+    const updatePosition = () => {
+      const input = document.getElementById(`inbound-note-${editingNoteIndex}`);
+      if (!input) return;
+      const rect = input.getBoundingClientRect();
+      const width = Math.min(360, window.innerWidth - 16);
+      const height = 180;
+      const left = Math.max(8, Math.min(rect.left, window.innerWidth - width - 8));
+      const top = rect.bottom + height + 8 <= window.innerHeight
+        ? rect.bottom + 4
+        : Math.max(8, rect.top - height - 4);
+      setNoteEditorPosition({ top, left, width });
+    };
+
+    updatePosition();
+    window.requestAnimationFrame(() => noteTextareaRef.current?.focus());
+    window.addEventListener('resize', updatePosition);
+    window.addEventListener('scroll', updatePosition, true);
+
+    const closeOnOutsideClick = (event: PointerEvent) => {
+      const target = event.target;
+      const anchor = document.getElementById(`inbound-note-${editingNoteIndex}`);
+      if (
+        target instanceof Node &&
+        !noteEditorRef.current?.contains(target) &&
+        !anchor?.contains(target)
+      ) {
+        setEditingNoteIndex(null);
+      }
+    };
+    const closeOnEscape = (event: KeyboardEvent) => {
+      if (event.key === 'Escape') setEditingNoteIndex(null);
+    };
+
+    document.addEventListener('pointerdown', closeOnOutsideClick);
+    document.addEventListener('keydown', closeOnEscape);
+    return () => {
+      window.removeEventListener('resize', updatePosition);
+      window.removeEventListener('scroll', updatePosition, true);
+      document.removeEventListener('pointerdown', closeOnOutsideClick);
+      document.removeEventListener('keydown', closeOnEscape);
+    };
+  }, [editingNoteIndex]);
 
   const beginEditInventoryRoll = (roll: InventoryRoll) => {
     const stockType = roll.stock_type || '';
@@ -195,7 +248,7 @@ export default function InboundPage() {
       if (!response.ok || !json.success) throw new Error(json.error || 'Không thể cập nhật cuộn.');
       setEditingInventoryRoll(null);
       setMessage({ type: 'success', text: json.message || 'Đã cập nhật thông tin cuộn.' });
-      await fetchInventory();
+      await fetchInventory(inventoryPage, inventorySearch);
     } catch (error) {
       console.error('Lỗi sửa cuộn từ bảng nhập kho:', error);
       setMessage({ type: 'error', text: error instanceof Error ? error.message : 'Không thể cập nhật cuộn.' });
@@ -272,36 +325,57 @@ export default function InboundPage() {
         : [{ name: 'code', label: 'Mã danh mục', required: true }]
   );
 
-  const fetchInventory = async (page = inventoryPage) => {
+  const fetchInventory = useCallback(async (page: number, searchTerm: string) => {
+    const requestId = ++inventoryRequestId.current;
+    setSelectedInventoryRollId(null);
     setInventoryLoading(true);
     try {
-      const res = await fetch(`/api/inventory?page=${page}&pageSize=50`, { cache: 'no-store' });
+      const params = new URLSearchParams({
+        page: String(page),
+        pageSize: String(INVENTORY_PAGE_SIZE),
+      });
+      if (searchTerm.trim()) params.set('search', searchTerm.trim());
+
+      const res = await fetch(`/api/inventory?${params}`, { cache: 'no-store' });
       const json = await res.json();
       if (!res.ok || !json.success) {
         throw new Error(json.error || 'Không thể tải bảng tồn kho.');
       }
-      setInventory(json.data || []);
-      setInventoryTotal(json.pagination?.total ?? 0);
+      if (requestId === inventoryRequestId.current) {
+        setInventory(json.data || []);
+        setInventoryTotal(json.pagination?.total ?? 0);
+      }
     } catch (err) {
-      console.error('Lỗi tải bảng tồn kho:', err);
-      setMessage({ type: 'error', text: err instanceof Error ? err.message : 'Không thể tải bảng tồn kho.' });
+      if (requestId === inventoryRequestId.current) {
+        console.error('Lỗi tải bảng tồn kho:', err);
+        setMessage({ type: 'error', text: err instanceof Error ? err.message : 'Không thể tải bảng tồn kho.' });
+      }
     } finally {
-      setInventoryLoading(false);
+      if (requestId === inventoryRequestId.current) setInventoryLoading(false);
     }
-  };
+  }, []);
 
   const changeInventoryPage = (page: number) => {
     setInventoryPage(page);
-    fetchInventory(page);
+    void fetchInventory(page, inventorySearch);
   };
 
   useEffect(() => {
     fetchMasterData();
-    fetchInventory();
   }, []);
 
+  useEffect(() => {
+    const delay = inventorySearch.trim() ? 250 : 0;
+    const timer = window.setTimeout(() => {
+      setInventoryPage(1);
+      void fetchInventory(1, inventorySearch);
+    }, delay);
+    return () => window.clearTimeout(timer);
+  }, [fetchInventory, inventorySearch]);
+
   const handleAddRow = () => {
-    setExpandedRowIndex(rows.length);
+    setSelectedInventoryRollId(null);
+    setSelectedRowIndex(rows.length);
     setRows([
       ...rows,
       {
@@ -324,9 +398,9 @@ export default function InboundPage() {
   const handleRemoveRow = (index: number) => {
     if (rows.length === 1) return;
     setRows(rows.filter((_, i) => i !== index));
-    setExpandedRowIndex((current) => {
+    setSelectedRowIndex((current) => {
       if (current === index) return Math.max(0, index - 1);
-      if (current !== null && current > index) return current - 1;
+      if (current > index) return current - 1;
       return current;
     });
   };
@@ -337,6 +411,81 @@ export default function InboundPage() {
     setRows(updated);
   };
 
+  const printInventoryRoll = (roll: InventoryRoll) => {
+    setLabelToPrint([{
+      roll_code: roll.roll_code,
+      barcode: roll.barcode || roll.roll_code,
+      fabric_name: roll.fabric_name || 'Chưa phân loại',
+      color_name: roll.color_name || '',
+      quantity: String(roll.quantity_remaining),
+      unit_name: roll.unit_name || 'm',
+      lot_code: roll.lot_code || '',
+      inbound_date: roll.inbound_date ? new Date(roll.inbound_date).toLocaleDateString('vi-VN') : '',
+    }]);
+  };
+
+  const copySelectedRow = () => {
+    if (selectedInventoryRoll) {
+      const nextIndex = rows.length;
+      const stockType = selectedInventoryRoll.stock_type || '';
+      const copied: InboundRow = {
+        stock_type: isStockType(stockType) ? stockType : 'REGULAR',
+        roll_code: '',
+        lot_code: selectedInventoryRoll.lot_code || '',
+        supplier_name: selectedInventoryRoll.supplier_name || '',
+        barcode: '',
+        fabric_id: String(selectedInventoryRoll.fabric_id),
+        color_id: selectedInventoryRoll.color_id ? String(selectedInventoryRoll.color_id) : '',
+        type_id: selectedInventoryRoll.type_id ? String(selectedInventoryRoll.type_id) : '',
+        location_id: selectedInventoryRoll.location_id ? String(selectedInventoryRoll.location_id) : '',
+        unit_id: selectedInventoryRoll.unit_id ? String(selectedInventoryRoll.unit_id) : '',
+        quantity_initial: String(selectedInventoryRoll.quantity_initial),
+        note: selectedInventoryRoll.note || '',
+      };
+      setRows([...rows, copied]);
+      setSelectedInventoryRollId(null);
+      setSelectedRowIndex(nextIndex);
+      setMessage({
+        type: 'success',
+        text: `Đã sao chép thông tin cuộn ${selectedInventoryRoll.roll_code} xuống dòng nhập ${nextIndex + 1}. Nhập mã cuộn mới cho dòng vừa sao chép.`,
+      });
+      window.setTimeout(() => {
+        const rollCodeInput = document.getElementById(`inbound-roll-code-${nextIndex}`);
+        rollCodeInput?.scrollIntoView({ block: 'nearest', inline: 'nearest' });
+        rollCodeInput?.focus();
+      }, 0);
+      return;
+    }
+
+    const source = rows[selectedRowIndex];
+    if (!source) return;
+    const copied = { ...source, roll_code: '', barcode: '' };
+    const nextIndex = rows.length;
+    setSelectedInventoryRollId(null);
+    setRows([...rows, copied]);
+    setSelectedRowIndex(nextIndex);
+    setMessage({
+      type: 'success',
+      text: `Đã sao chép thông tin dòng ${selectedRowIndex + 1} sang dòng ${nextIndex + 1}. Nhập mã cuộn mới cho dòng vừa sao chép.`,
+    });
+    window.setTimeout(() => {
+      const rollCodeInput = document.getElementById(`inbound-roll-code-${nextIndex}`);
+      rollCodeInput?.scrollIntoView({ block: 'nearest', inline: 'nearest' });
+      rollCodeInput?.focus();
+    }, 0);
+  };
+
+  const printSelectedRow = () => {
+    if (!selectedInventoryRoll) {
+      setMessage({
+        type: 'error',
+        text: 'Vui lòng chọn một cuộn trong bảng tồn kho trước khi in tem.',
+      });
+      return;
+    }
+    printInventoryRoll(selectedInventoryRoll);
+  };
+
   const handleSubmit = async (e: React.FormEvent) => {
     e.preventDefault();
 
@@ -344,7 +493,7 @@ export default function InboundPage() {
       (row) => !row.roll_code.trim() || !row.fabric_id || !row.quantity_initial || Number(row.quantity_initial) <= 0
     );
     if (invalidRowIndex !== -1) {
-      setExpandedRowIndex(invalidRowIndex);
+      setSelectedRowIndex(invalidRowIndex);
       setMessage({
         type: 'error',
         text: `Vui lòng điền đủ mã cuộn, loại vải và số lượng hợp lệ cho cuộn #${invalidRowIndex + 1}.`,
@@ -399,8 +548,8 @@ export default function InboundPage() {
             note: '',
           },
         ]);
-        setExpandedRowIndex(0);
-        await fetchInventory();
+        setSelectedRowIndex(0);
+        await fetchInventory(inventoryPage, inventorySearch);
       } else {
         setMessage({ type: 'error', text: json.error || 'Có lỗi xảy ra khi nhập kho.' });
       }
@@ -413,17 +562,14 @@ export default function InboundPage() {
   };
 
   return (
-    <div className="max-w-screen-2xl mx-auto space-y-6">
+    <div className="mx-auto max-w-screen-2xl space-y-4">
       {/* Header */}
-      <div className="flex flex-col gap-4 xl:flex-row xl:items-end xl:justify-between">
+      <div className="flex flex-col gap-3 border border-slate-400 bg-gradient-to-b from-slate-100 to-slate-300 px-3 py-2 shadow-sm xl:flex-row xl:items-center xl:justify-between">
         <div>
-          <h1 className="text-2xl font-bold text-slate-900">Nhập Kho Vải</h1>
-          <p className="text-sm text-slate-500 mt-0.5">Thêm nhiều cuộn vải vào hệ thống trong một giao dịch Transaction duy nhất</p>
+          <h1 className="text-sm font-bold text-slate-900">Nhập kho vải</h1>
+          <p className="mt-0.5 text-[11px] text-slate-600">Nhập danh sách cuộn vải</p>
         </div>
-        <div className="flex flex-col gap-3 sm:flex-row sm:items-center">
-          <PageViewToggle mode={viewMode} onChange={setViewMode} />
-        </div>
-        </div>
+      </div>
 
       {message && (
         <div
@@ -442,380 +588,396 @@ export default function InboundPage() {
         </div>
       )}
 
-      <div className={viewMode === 'both' ? 'grid grid-cols-1 items-stretch gap-6 xl:grid-cols-2' : 'space-y-6'}>
-      {/* Form Nhập Batch */}
-      {viewMode !== 'table' && <form onSubmit={handleSubmit} className="min-w-0 space-y-4">
-        <div className="bg-white border border-slate-200 rounded-2xl p-6 shadow-xs space-y-4">
-          <div className="flex items-center justify-between pb-4 border-b border-slate-100">
-            <h2 className="font-semibold text-slate-900 text-base">Danh sách cuộn vải nhập kho ({rows.length})</h2>
-            <button
-              type="button"
-              onClick={handleAddRow}
-              className="flex items-center gap-1.5 px-3 py-1.5 bg-blue-50 text-blue-600 hover:bg-blue-100 rounded-lg text-xs font-semibold transition-colors"
-            >
-              <Plus className="w-4 h-4" /> Thêm dòng
-            </button>
+      <form onSubmit={handleSubmit} className="min-w-0">
+        <div className="space-y-0 border border-slate-400 bg-[#f5f5f5] shadow-md">
+          <div className="flex flex-wrap items-center justify-between gap-2 border-b border-slate-400 bg-gradient-to-b from-white to-slate-200 px-2 py-1.5">
+            <div className="flex flex-wrap items-center gap-2">
+              <h2 className="text-xs font-bold text-slate-800">Danh sách cuộn vải nhập kho</h2>
+              <span className="border border-slate-400 bg-white px-1.5 py-0.5 text-[10px] font-semibold text-slate-700">
+                {inventoryTotal.toLocaleString('vi-VN')} trong kho · {rows.length} dòng mới
+              </span>
+            </div>
+            <div className="flex w-full items-center gap-1.5 sm:w-auto sm:flex-nowrap">
+              <input
+                type="search"
+                value={inventorySearch}
+                onChange={(event) => setInventorySearch(event.target.value)}
+                placeholder="Tìm cuộn đã có..."
+                aria-label="Tìm cuộn vải đã có trong kho"
+                className="h-7 w-full min-w-0 border border-slate-400 bg-white px-2 text-[11px] text-slate-900 shadow-inner focus:border-blue-600 focus:outline-hidden focus:ring-1 focus:ring-blue-500 sm:w-56"
+              />
+              <button
+                type="button"
+                onClick={() => void fetchInventory(inventoryPage, inventorySearch)}
+                disabled={inventoryLoading}
+                className="flex h-7 shrink-0 items-center gap-1 border border-slate-400 bg-gradient-to-b from-white to-slate-200 px-2 text-[11px] font-semibold text-slate-800 hover:to-slate-300 disabled:opacity-50"
+              >
+                <RefreshCw className={`h-3.5 w-3.5 ${inventoryLoading ? 'animate-spin' : ''}`} />
+                Làm mới
+              </button>
+            </div>
           </div>
 
-          <div className="space-y-4">
-            {rows.map((row, index) => (
-              <div key={index} className="p-4 bg-slate-50 border border-slate-200 rounded-xl relative space-y-3">
-                <div className="flex items-center justify-between gap-3">
-                  <button
-                    type="button"
-                    aria-expanded={expandedRowIndex === index}
-                    onClick={() => setExpandedRowIndex((current) => current === index ? null : index)}
-                    className="flex min-w-0 flex-1 items-center justify-between gap-3 text-left"
-                  >
-                    <span className="min-w-0">
-                      <span className="block text-xs font-bold text-slate-700 uppercase">Cuộn #{index + 1}</span>
-                      {expandedRowIndex !== index && (
-                        <span className="mt-1 block truncate text-xs text-slate-500">
-                          {row.roll_code || 'Chưa có mã cuộn'}
-                          {' · '}
-                          {masterData.fabrics.find((fabric) => String(fabric.id) === row.fabric_id)?.name || 'Chưa chọn loại vải'}
-                          {' · '}
-                          {row.stock_type === 'SAVING' ? 'Vải tiết kiệm' : row.stock_type === 'REMNANT' ? 'Đầu khúc' : 'Vải thường'}
-                          {' · '}
-                          {row.quantity_initial ? `${row.quantity_initial} ${masterData.units.find((unit) => String(unit.id) === row.unit_id)?.name || 'm'}` : 'Chưa nhập số lượng'}
-                        </span>
-                      )}
-                    </span>
-                    {expandedRowIndex === index
-                      ? <ChevronUp className="h-4 w-4 shrink-0 text-slate-500" />
-                      : <ChevronDown className="h-4 w-4 shrink-0 text-slate-500" />}
-                  </button>
-                  {rows.length > 1 && (
-                    <button
-                      type="button"
-                      onClick={() => handleRemoveRow(index)}
-                      className="text-rose-500 hover:text-rose-700 p-1 transition-colors"
-                      title="Xóa dòng này"
-                    >
-                      <Trash2 className="w-4 h-4" />
-                    </button>
-                  )}
-                </div>
-
-                {expandedRowIndex === index && (
-                  <div className="space-y-3">
-                    <div className="grid grid-cols-1 md:grid-cols-4 gap-3">
-                  {/* Mã cuộn */}
-                  <div>
-                    <label className="block text-[11px] font-semibold text-slate-600 uppercase mb-1">
-                      Mã cuộn <span className="text-rose-500">*</span>
-                    </label>
-                    <input
-                      type="text"
-                      required
-                      maxLength={100}
-                      value={row.roll_code}
-                      onChange={(e) => handleChangeRow(index, 'roll_code', e.target.value)}
-                      placeholder="VD: CV-2026-001"
-                      className="w-full px-3 py-2 bg-white border border-slate-300 rounded-lg text-xs text-slate-900 focus:outline-hidden focus:ring-2 focus:ring-blue-500"
-                    />
-                  </div>
-
-                  <div>
-                    <label className="block text-[11px] font-semibold text-slate-600 uppercase mb-1">Mã lô</label>
-                    <input
-                      maxLength={100}
-                      value={row.lot_code}
-                      onChange={(event) => handleChangeRow(index, 'lot_code', event.target.value)}
-                      placeholder="VD: LÔ-BB12"
-                      className="w-full rounded-lg border border-slate-300 bg-white px-3 py-2 text-xs text-slate-900"
-                    />
-                  </div>
-
-                  <div>
-                    <label className="block text-[11px] font-semibold text-slate-600 uppercase mb-1">Nhà cung cấp / nơi nhập</label>
-                    <input
-                      maxLength={160}
-                      value={row.supplier_name}
-                      onChange={(event) => handleChangeRow(index, 'supplier_name', event.target.value)}
-                      placeholder="Tên nhà cung cấp"
-                      className="w-full rounded-lg border border-slate-300 bg-white px-3 py-2 text-xs text-slate-900"
-                    />
-                  </div>
-
-                  <div>
-                    <label className="block text-[11px] font-semibold text-slate-600 uppercase mb-1">
-                      Phân loại tồn kho <span className="text-rose-500">*</span>
-                    </label>
-                    <select
-                      required
-                      value={row.stock_type}
-                      onChange={(event) => {
-                        if (isStockType(event.target.value)) {
-                          handleChangeRow(index, 'stock_type', event.target.value);
+          <div className="overflow-x-auto border-b border-slate-400 bg-white">
+            <div className="min-w-[1000px]">
+              <div className="max-h-[54vh] overflow-y-auto">
+                <table className="w-full table-fixed border-collapse text-left text-[11px]">
+                  <colgroup>
+                    <col className="w-[3%]" /><col className="w-[9%]" /><col className="w-[7%]" />
+                    <col className="w-[10%]" /><col className="w-[9%]" /><col className="w-[10%]" />
+                    <col className="w-[7%]" /><col className="w-[8%]" /><col className="w-[9%]" />
+                    <col className="w-[7%]" /><col className="w-[7%]" /><col className="w-[9.5%]" />
+                    <col className="w-[4.5%]" />
+                  </colgroup>
+                <thead className="sticky top-0 z-10 bg-gradient-to-b from-slate-100 to-slate-300 text-[10px] font-semibold uppercase text-slate-700">
+                  <tr>
+                    <th className="border border-slate-400 px-1 py-1.5">#</th>
+                    <th className="border border-slate-400 px-1 py-1.5">Mã cuộn *</th>
+                    <th className="border border-slate-400 px-1 py-1.5">Mã lô</th>
+                    <th className="border border-slate-400 px-1 py-1.5">Nhà cung cấp / nơi nhập</th>
+                    <th className="border border-slate-400 px-1 py-1.5">Phân loại tồn kho *</th>
+                    <th className="border border-slate-400 px-1 py-1.5">Loại vải *</th>
+                    <th className="border border-slate-400 px-1 py-1.5">Màu sắc</th>
+                    <th className="border border-slate-400 px-1 py-1.5">Kiểu dệt / loại</th>
+                    <th className="border border-slate-400 px-1 py-1.5">Vị trí kệ</th>
+                    <th className="border border-slate-400 px-1 py-1.5">Số lượng *</th>
+                    <th className="border border-slate-400 px-1 py-1.5">Đơn vị</th>
+                    <th className="border border-slate-400 px-1 py-1.5">Ghi chú</th>
+                    <th className="border border-slate-400 px-1 py-1.5"><span className="sr-only">Thao tác</span></th>
+                  </tr>
+                </thead>
+                <tbody>
+                  {inventoryLoading ? (
+                    <tr><td colSpan={13} className="border border-slate-300 px-3 py-6 text-center text-slate-500">Đang tải cuộn vải đã có...</td></tr>
+                  ) : inventory.length === 0 && inventorySearch.trim() ? (
+                    <tr><td colSpan={13} className="border border-slate-300 px-3 py-4 text-center text-slate-500">Không tìm thấy cuộn vải phù hợp.</td></tr>
+                  ) : inventory.length === 0 ? (
+                    <tr><td colSpan={13} className="border border-slate-300 px-3 py-4 text-center text-slate-500">Chưa có cuộn vải trong kho.</td></tr>
+                  ) : inventory.map((roll, index) => (
+                    <tr
+                      key={roll.roll_id}
+                      onClick={() => setSelectedInventoryRollId(roll.roll_id)}
+                      onKeyDown={(event) => {
+                        if (event.key === 'Enter' || event.key === ' ') {
+                          event.preventDefault();
+                          setSelectedInventoryRollId(roll.roll_id);
                         }
                       }}
-                      className="w-full rounded-lg border border-slate-300 bg-white px-3 py-2 text-xs text-slate-900 focus:outline-hidden focus:ring-2 focus:ring-blue-500"
+                      tabIndex={0}
+                      aria-selected={selectedInventoryRollId === roll.roll_id}
+                      aria-label={`Chọn cuộn ${roll.roll_code} để in tem`}
+                      className={`cursor-pointer focus:outline-hidden focus:ring-2 focus:ring-inset focus:ring-blue-500 ${
+                        selectedInventoryRollId === roll.roll_id
+                          ? 'bg-[#dbeafe]'
+                          : index % 2 === 0 ? 'bg-white hover:bg-slate-50' : 'bg-[#f7f7f7] hover:bg-slate-50'
+                      }`}
                     >
-                      <option value="REGULAR">Vải thường</option>
-                      <option value="SAVING">Vải tiết kiệm (TK)</option>
-                      <option value="REMNANT">Đầu vải / Đầu khúc</option>
-                    </select>
-                  </div>
-
-                  {/* Tên vải */}
-                  <div>
-                    <label className="block text-[11px] font-semibold text-slate-600 uppercase mb-1">
-                      Loại vải <span className="text-rose-500">*</span>
-                    </label>
-                    <SearchableCombobox
-                      required
-                      ariaLabel="Tên vải"
-                      value={row.fabric_id}
-                      onChange={(value) => handleChangeRow(index, 'fabric_id', value)}
-                      placeholder="Tìm tên hoặc mã vải..."
-                      createFields={catalogCreateFields('fabrics')}
-                      onCreateOption={(name, fields) => addCatalogItem('fabrics', name, fields)}
-                      options={masterData.fabrics.map((fabric) => ({
-                        value: String(fabric.id),
-                        label: fabric.code ? `${fabric.name} (${fabric.code})` : fabric.name,
-                      }))}
-                      className="py-2 pl-9 pr-9 text-xs"
-                    />
-                  </div>
-
-                  {/* Màu sắc */}
-                  <div>
-                    <label className="block text-[11px] font-semibold text-slate-600 uppercase mb-1">Màu sắc</label>
-                    <SearchableCombobox
-                      ariaLabel="Màu sắc"
-                      value={row.color_id}
-                      onChange={(value) => handleChangeRow(index, 'color_id', value)}
-                      placeholder="Tìm màu..."
-                      createFields={catalogCreateFields('colors')}
-                      onCreateOption={(name, fields) => addCatalogItem('colors', name, fields)}
-                      options={masterData.colors.map((color) => ({ value: String(color.id), label: color.name }))}
-                      className="py-2 pl-9 pr-9 text-xs"
-                    />
-                  </div>
-
-                  {/* Kiểu loại */}
-                  <div>
-                    <label className="block text-[11px] font-semibold text-slate-600 uppercase mb-1">Kiểu dệt / Loại</label>
-                    <SearchableCombobox
-                      ariaLabel="Kiểu dệt hoặc loại vải"
-                      value={row.type_id}
-                      onChange={(value) => handleChangeRow(index, 'type_id', value)}
-                      placeholder="Tìm kiểu vải..."
-                      createFields={catalogCreateFields('types')}
-                      onCreateOption={(name, fields) => addCatalogItem('types', name, fields)}
-                      options={masterData.types.map((type) => ({ value: String(type.id), label: type.name }))}
-                      className="py-2 pl-9 pr-9 text-xs"
-                    />
-                  </div>
-
-                  {/* Vị trí kệ */}
-                  <div>
-                    <label className="block text-[11px] font-semibold text-slate-600 uppercase mb-1">Vị trí kệ</label>
-                    <SearchableCombobox
-                      ariaLabel="Vị trí kệ"
-                      value={row.location_id}
-                      onChange={(value) => handleChangeRow(index, 'location_id', value)}
-                      placeholder="Tìm vị trí kệ..."
-                      createFields={catalogCreateFields('locations')}
-                      onCreateOption={(name, fields) => addCatalogItem('locations', name, fields)}
-                      options={masterData.locations.map((location) => ({
-                        value: String(location.id),
-                        label: location.code && location.name !== location.code
-                          ? `${location.code} - ${location.name}`
-                          : location.code || location.name,
-                      }))}
-                      className="py-2 pl-9 pr-9 text-xs"
-                    />
-                  </div>
-
-                  {/* Số lượng */}
-                  <div>
-                    <label className="block text-[11px] font-semibold text-slate-600 uppercase mb-1">
-                      Số lượng <span className="text-rose-500">*</span>
-                    </label>
-                    <input
-                      type="number"
-                      step="0.01"
-                      required
-                      min="0.01"
-                      value={row.quantity_initial}
-                      onChange={(e) => handleChangeRow(index, 'quantity_initial', e.target.value)}
-                      placeholder="VD: 100"
-                      className="w-full px-3 py-2 bg-white border border-slate-300 rounded-lg text-xs text-slate-900 focus:outline-hidden focus:ring-2 focus:ring-blue-500"
-                    />
-                  </div>
-
-                  {/* Đơn vị */}
-                  <div>
-                    <label className="block text-[11px] font-semibold text-slate-600 uppercase mb-1">Đơn vị</label>
-                    <SearchableCombobox
-                      ariaLabel="Đơn vị"
-                      value={row.unit_id}
-                      onChange={(value) => handleChangeRow(index, 'unit_id', value)}
-                      placeholder="Tìm đơn vị..."
-                      createFields={catalogCreateFields('units')}
-                      onCreateOption={(name, fields) => addCatalogItem('units', name, fields)}
-                      options={masterData.units.map((unit) => ({ value: String(unit.id), label: unit.name }))}
-                      className="py-2 pl-9 pr-9 text-xs"
-                    />
-                  </div>
-                    </div>
-
-                    <div>
-                      <input
-                        type="text"
-                        value={row.note}
-                        onChange={(e) => handleChangeRow(index, 'note', e.target.value)}
-                        placeholder="Ghi chú cho cuộn vải này..."
-                        className="w-full px-3 py-1.5 bg-white border border-slate-300 rounded-lg text-xs text-slate-900 focus:outline-hidden focus:ring-2 focus:ring-blue-500"
-                      />
-                    </div>
-                  </div>
-                )}
-              </div>
-            ))}
-          </div>
-
-          <div className="flex items-center justify-between pt-4 border-t border-slate-100">
-            <button
-              type="button"
-              onClick={handleAddRow}
-              className="flex items-center gap-1.5 px-4 py-2 bg-slate-100 hover:bg-slate-200 text-slate-700 rounded-lg text-xs font-semibold transition-colors"
-            >
-              <Plus className="w-4 h-4" /> Thêm dòng mới
-            </button>
-            <button
-              type="submit"
-              disabled={loading}
-              className="flex items-center gap-2 px-6 py-2.5 bg-blue-600 hover:bg-blue-700 text-white rounded-lg text-sm font-semibold transition-colors shadow-xs disabled:opacity-50"
-            >
-              <PackagePlus className="w-4 h-4" />
-              <span>{loading ? 'Đang xử lý Batch Transaction...' : `Xác nhận Nhập ${rows.length} Cuộn`}</span>
-            </button>
-          </div>
-        </div>
-      </form>}
-
-      {viewMode !== 'entry' && (
-        <section className="flex h-full min-w-0 flex-col overflow-hidden rounded-2xl border border-slate-200 bg-white shadow-xs">
-          <div className="flex items-center justify-between gap-3 border-b border-slate-100 p-4">
-            <div>
-              <h2 className="flex items-center gap-2 font-semibold text-slate-900">
-                <Table2 className="h-4 w-4 text-blue-600" />
-                Bảng tồn kho ({inventoryTotal.toLocaleString('vi-VN')} cuộn)
-              </h2>
-              <p className="mt-1 text-xs text-slate-500">Danh sách cuộn hiện có trong kho</p>
+                      <td className="border border-slate-300 px-1.5 py-1 text-center text-slate-500">{(inventoryPage - 1) * INVENTORY_PAGE_SIZE + index + 1}</td>
+                      <td title={roll.roll_code} className="break-words whitespace-normal border border-slate-300 px-1.5 py-1 font-semibold text-slate-900">{roll.roll_code}</td>
+                      <td title={roll.lot_code || ''} className="break-words whitespace-normal border border-slate-300 px-1.5 py-1">{roll.lot_code || '—'}</td>
+                      <td title={roll.supplier_name || ''} className="break-words whitespace-normal border border-slate-300 px-1.5 py-1">{roll.supplier_name || '—'}</td>
+                      <td title={roll.stock_type === 'SAVING' ? 'Vải tiết kiệm (TK)' : roll.stock_type === 'REMNANT' ? 'Đầu vải / Đầu khúc' : 'Vải thường'} className="break-words whitespace-normal border border-slate-300 px-1.5 py-1">
+                        {roll.stock_type === 'SAVING' ? 'Vải tiết kiệm (TK)' : roll.stock_type === 'REMNANT' ? 'Đầu vải / Đầu khúc' : 'Vải thường'}
+                      </td>
+                      <td title={roll.fabric_name || ''} className="break-words whitespace-normal border border-slate-300 px-1.5 py-1">{roll.fabric_name || '—'}</td>
+                      <td title={roll.color_name || ''} className="break-words whitespace-normal border border-slate-300 px-1.5 py-1">{roll.color_name || '—'}</td>
+                      <td title={roll.type_name || ''} className="break-words whitespace-normal border border-slate-300 px-1.5 py-1">{roll.type_name || '—'}</td>
+                      <td title={roll.location_code || roll.location_name || ''} className="break-words whitespace-normal border border-slate-300 px-1.5 py-1">{roll.location_code || roll.location_name || '—'}</td>
+                      <td title={String(roll.quantity_initial)} className="border border-slate-300 px-1.5 py-1 text-right">{roll.quantity_initial}</td>
+                      <td title={roll.unit_name || 'm'} className="break-words whitespace-normal border border-slate-300 px-1.5 py-1">{roll.unit_name || 'm'}</td>
+                      <td title={roll.note || ''} className="break-words whitespace-normal border border-slate-300 px-1.5 py-1">{roll.note || '—'}</td>
+                      <td className="border border-slate-300 px-1 py-1 text-center">
+                        <button
+                          type="button"
+                          onClick={(event) => {
+                            event.stopPropagation();
+                            beginEditInventoryRoll(roll);
+                          }}
+                          title={`Sửa ${roll.roll_code}`}
+                          aria-label={`Sửa ${roll.roll_code}`}
+                          className="border border-transparent p-1 text-blue-700 hover:border-blue-300 hover:bg-blue-50"
+                        >
+                          <Pencil className="h-3.5 w-3.5" />
+                        </button>
+                      </td>
+                    </tr>
+                  ))}
+                </tbody>
+              </table>
             </div>
-            <button
-              type="button"
-              onClick={() => fetchInventory()}
-              disabled={inventoryLoading}
-              className="flex shrink-0 items-center gap-2 rounded-lg border border-slate-200 px-3 py-2 text-xs font-medium text-slate-700 transition-colors hover:bg-slate-50 disabled:opacity-50"
-            >
-              <RefreshCw className={`h-3.5 w-3.5 ${inventoryLoading ? 'animate-spin' : ''}`} />
-              Làm mới bảng
-            </button>
+
+            <div className="border-t border-slate-400">
+              <div className="bg-slate-100 px-2 py-1 text-[10px] font-semibold uppercase tracking-wide text-slate-600">
+                Dòng mới — chỉ các dòng bên dưới sẽ được nhập kho
+              </div>
+              <table className="w-full table-fixed border-collapse text-left text-[11px]">
+                <colgroup>
+                  <col className="w-[3%]" /><col className="w-[9%]" /><col className="w-[7%]" />
+                  <col className="w-[10%]" /><col className="w-[9%]" /><col className="w-[10%]" />
+                  <col className="w-[7%]" /><col className="w-[8%]" /><col className="w-[9%]" />
+                  <col className="w-[7%]" /><col className="w-[7%]" /><col className="w-[9.5%]" />
+                  <col className="w-[4.5%]" />
+                </colgroup>
+                <tbody>
+                  {rows.map((row, index) => (
+                    <tr
+                      key={index}
+                      onClick={() => {
+                        setSelectedRowIndex(index);
+                        setSelectedInventoryRollId(null);
+                      }}
+                      onFocusCapture={() => {
+                        setSelectedRowIndex(index);
+                        setSelectedInventoryRollId(null);
+                      }}
+                      className={selectedRowIndex === index ? 'bg-[#e6f0ff]' : index % 2 === 0 ? 'bg-white hover:bg-slate-50' : 'bg-[#f7f7f7] hover:bg-slate-50'}
+                      aria-selected={selectedRowIndex === index}
+                    >
+                      <td className="border border-slate-300 px-1 py-1 text-center text-slate-500">{index + 1}</td>
+                      <td className="border border-slate-300 px-1 py-1">
+                        <input
+                          required
+                          id={`inbound-roll-code-${index}`}
+                          maxLength={100}
+                          aria-label={`Mã cuộn dòng ${index + 1}`}
+                          value={row.roll_code}
+                          onChange={(event) => handleChangeRow(index, 'roll_code', event.target.value)}
+                          title={row.roll_code}
+                          placeholder="Mã cuộn"
+                          className="h-7 w-full border border-slate-300 bg-white px-1 text-[13px] font-medium text-slate-900 placeholder:text-slate-500 focus:border-blue-600 focus:outline-hidden focus:ring-1 focus:ring-blue-500"
+                        />
+                      </td>
+                      <td className="border border-slate-300 px-1 py-1">
+                        <input
+                          maxLength={100}
+                          aria-label={`Mã lô dòng ${index + 1}`}
+                          value={row.lot_code}
+                          onChange={(event) => handleChangeRow(index, 'lot_code', event.target.value)}
+                          title={row.lot_code}
+                          placeholder="Mã lô"
+                          className="h-7 w-full border border-slate-300 bg-white px-1 text-[13px] font-medium text-slate-900 placeholder:text-slate-500"
+                        />
+                      </td>
+                      <td className="border border-slate-300 px-1 py-1">
+                        <input
+                          maxLength={160}
+                          aria-label={`Nhà cung cấp hoặc nơi nhập dòng ${index + 1}`}
+                          value={row.supplier_name}
+                          onChange={(event) => handleChangeRow(index, 'supplier_name', event.target.value)}
+                          title={row.supplier_name}
+                          placeholder="Nhà cung cấp"
+                          className="h-7 w-full border border-slate-300 bg-white px-1 text-[13px] font-medium text-slate-900 placeholder:text-slate-500"
+                        />
+                      </td>
+                      <td className="border border-slate-300 px-1 py-1">
+                        <select
+                          required
+                          aria-label={`Phân loại tồn kho dòng ${index + 1}`}
+                          value={row.stock_type}
+                          onChange={(event) => {
+                            if (isStockType(event.target.value)) handleChangeRow(index, 'stock_type', event.target.value);
+                          }}
+                          title={row.stock_type === 'SAVING' ? 'Vải tiết kiệm (TK)' : row.stock_type === 'REMNANT' ? 'Đầu vải / Đầu khúc' : 'Vải thường'}
+                          className="h-7 w-full border border-slate-300 bg-white px-1 text-[12px] font-medium text-slate-900"
+                        >
+                          <option value="REGULAR">Vải thường</option>
+                          <option value="SAVING">Vải tiết kiệm (TK)</option>
+                          <option value="REMNANT">Đầu vải / Đầu khúc</option>
+                        </select>
+                      </td>
+                      <td className="border border-slate-300 px-1 py-1">
+                        <SearchableCombobox
+                          required
+                          ariaLabel={`Loại vải dòng ${index + 1}`}
+                          value={row.fabric_id}
+                          onChange={(value) => handleChangeRow(index, 'fabric_id', value)}
+                          placeholder="Loại vải"
+                          createFields={catalogCreateFields('fabrics')}
+                          onCreateOption={(name, fields) => addCatalogItem('fabrics', name, fields)}
+                          showSearchIcon={false}
+                          showChevron={false}
+                          options={masterData.fabrics.map((fabric) => ({
+                            value: String(fabric.id),
+                            label: fabric.code ? `${fabric.name} (${fabric.code})` : fabric.name,
+                          }))}
+                          className="!h-7 !rounded-none !border-slate-300 !py-1 !pl-2 !pr-2 !text-[13px] !font-medium !text-slate-900 placeholder:!text-slate-500"
+                        />
+                      </td>
+                      <td className="border border-slate-300 px-1 py-1">
+                        <SearchableCombobox
+                          ariaLabel={`Màu sắc dòng ${index + 1}`}
+                          value={row.color_id}
+                          onChange={(value) => handleChangeRow(index, 'color_id', value)}
+                          placeholder="Màu sắc"
+                          createFields={catalogCreateFields('colors')}
+                          onCreateOption={(name, fields) => addCatalogItem('colors', name, fields)}
+                          showSearchIcon={false}
+                          showChevron={false}
+                          options={masterData.colors.map((color) => ({ value: String(color.id), label: color.name }))}
+                          className="!h-7 !rounded-none !border-slate-300 !py-1 !pl-2 !pr-2 !text-[13px] !font-medium !text-slate-900 placeholder:!text-slate-500"
+                        />
+                      </td>
+                      <td className="border border-slate-300 px-1 py-1">
+                        <SearchableCombobox
+                          ariaLabel={`Kiểu dệt hoặc loại vải dòng ${index + 1}`}
+                          value={row.type_id}
+                          onChange={(value) => handleChangeRow(index, 'type_id', value)}
+                          placeholder="Kiểu dệt"
+                          createFields={catalogCreateFields('types')}
+                          onCreateOption={(name, fields) => addCatalogItem('types', name, fields)}
+                          showSearchIcon={false}
+                          showChevron={false}
+                          options={masterData.types.map((type) => ({ value: String(type.id), label: type.name }))}
+                          className="!h-7 !rounded-none !border-slate-300 !py-1 !pl-2 !pr-2 !text-[13px] !font-medium !text-slate-900 placeholder:!text-slate-500"
+                        />
+                      </td>
+                      <td className="border border-slate-300 px-1 py-1">
+                        <SearchableCombobox
+                          ariaLabel={`Vị trí kệ dòng ${index + 1}`}
+                          value={row.location_id}
+                          onChange={(value) => handleChangeRow(index, 'location_id', value)}
+                          placeholder="Vị trí"
+                          createFields={catalogCreateFields('locations')}
+                          onCreateOption={(name, fields) => addCatalogItem('locations', name, fields)}
+                          showSearchIcon={false}
+                          showChevron={false}
+                          options={masterData.locations.map((location) => ({
+                            value: String(location.id),
+                            label: location.code && location.name !== location.code
+                              ? `${location.code} - ${location.name}`
+                              : location.code || location.name,
+                          }))}
+                          className="!h-7 !rounded-none !border-slate-300 !py-1 !pl-2 !pr-2 !text-[13px] !font-medium !text-slate-900 placeholder:!text-slate-500"
+                        />
+                      </td>
+                      <td className="border border-slate-300 px-1 py-1">
+                        <input
+                          type="number"
+                          step="0.01"
+                          min="0.01"
+                          required
+                          aria-label={`Số lượng dòng ${index + 1}`}
+                          value={row.quantity_initial}
+                          onChange={(event) => handleChangeRow(index, 'quantity_initial', event.target.value)}
+                          title={row.quantity_initial}
+                          placeholder="0.00"
+                          className="h-7 w-full border border-slate-300 bg-white px-1 text-right text-[13px] font-medium text-slate-900 placeholder:text-slate-500"
+                        />
+                      </td>
+                      <td className="border border-slate-300 px-1 py-1">
+                        <SearchableCombobox
+                          ariaLabel={`Đơn vị dòng ${index + 1}`}
+                          value={row.unit_id}
+                          onChange={(value) => handleChangeRow(index, 'unit_id', value)}
+                          placeholder="Đơn vị"
+                          createFields={catalogCreateFields('units')}
+                          onCreateOption={(name, fields) => addCatalogItem('units', name, fields)}
+                          showSearchIcon={false}
+                          showChevron={false}
+                          options={masterData.units.map((unit) => ({ value: String(unit.id), label: unit.name }))}
+                          className="!h-7 !rounded-none !border-slate-300 !py-1 !pl-2 !pr-2 !text-[13px] !font-medium !text-slate-900 placeholder:!text-slate-500"
+                        />
+                      </td>
+                      <td className="border border-slate-300 px-1 py-1">
+                        <input
+                          id={`inbound-note-${index}`}
+                          type="text"
+                          aria-label={`Ghi chú dòng ${index + 1}`}
+                          value={row.note}
+                          onChange={(event) => handleChangeRow(index, 'note', event.target.value)}
+                          onFocus={() => setEditingNoteIndex(index)}
+                          onClick={() => noteTextareaRef.current?.focus()}
+                          placeholder="Ghi chú"
+                          title={row.note}
+                          className="h-7 w-full border border-slate-300 bg-white px-1 text-[13px] font-medium leading-5 text-slate-900 placeholder:text-slate-500"
+                        />
+                      </td>
+                      <td className="border border-slate-300 px-1 py-1 text-center">
+                        <button
+                          type="button"
+                          disabled={rows.length === 1}
+                          onClick={() => handleRemoveRow(index)}
+                          className="rounded p-1 text-rose-500 transition-colors hover:bg-rose-50 hover:text-rose-700 disabled:cursor-not-allowed disabled:opacity-30"
+                          title="Xóa dòng này"
+                          aria-label={`Xóa dòng ${index + 1}`}
+                        >
+                          <Trash2 className="h-4 w-4" />
+                        </button>
+                      </td>
+                    </tr>
+                  ))}
+                </tbody>
+              </table>
+            </div>
           </div>
-          <div className="max-h-[75vh] flex-1 overflow-auto">
-            <table className="w-full min-w-[720px] text-left text-xs">
-              <thead className="sticky top-0 z-10 border-b border-slate-200 bg-slate-50 text-[11px] font-semibold uppercase text-slate-600">
-                <tr>
-                  <th className="px-3 py-3">Mã cuộn</th>
-                  <th className="px-3 py-3">Vải / Màu</th>
-                  <th className="px-3 py-3">Vị trí</th>
-                  <th className="px-3 py-3 text-right">Ban đầu</th>
-                  <th className="px-3 py-3 text-right">Còn lại</th>
-                  <th className="px-3 py-3 text-center">Trạng thái</th>
-                  <th className="px-3 py-3 text-right">Thao tác</th>
-                </tr>
-              </thead>
-              <tbody className="divide-y divide-slate-100">
-                {inventoryLoading ? (
-                  <tr><td colSpan={7} className="py-10 text-center text-slate-400">Đang tải bảng tồn kho...</td></tr>
-                ) : inventory.length === 0 ? (
-                  <tr><td colSpan={7} className="py-10 text-center text-slate-400">Chưa có cuộn vải trong kho.</td></tr>
-                ) : inventory.map((roll) => (
-                  <tr key={roll.roll_id} className="hover:bg-slate-50">
-                    <td className="px-3 py-2.5">
-                      <div className="font-semibold text-slate-900">{roll.roll_code}</div>
-                      <div className="mt-0.5 text-[10px] text-slate-400">{roll.barcode || 'Chưa có barcode'}</div>
-                    </td>
-                    <td className="px-3 py-2.5">
-                      <div className="font-medium text-slate-800">{roll.fabric_name || 'Chưa phân loại'}</div>
-                      <div className="text-[10px] text-slate-500">{roll.color_name || 'Mặc định'}</div>
-                      {roll.stock_type === 'SAVING' && <span className="mt-1 inline-flex rounded-full bg-amber-50 px-2 py-0.5 text-[10px] font-semibold text-amber-800">Vải tiết kiệm</span>}
-                      {roll.stock_type === 'REMNANT' && <span className="mt-1 inline-flex rounded-full bg-violet-50 px-2 py-0.5 text-[10px] font-semibold text-violet-800">Đầu khúc</span>}
-                      {roll.stock_type !== 'SAVING' && roll.stock_type !== 'REMNANT' && <span className="mt-1 inline-flex rounded-full bg-slate-100 px-2 py-0.5 text-[10px] font-semibold text-slate-700">Vải thường</span>}
-                    </td>
-                    <td className="px-3 py-2.5 text-slate-600">{roll.location_code || roll.location_name || 'Chưa xếp kệ'}</td>
-                    <td className="px-3 py-2.5 text-right text-slate-600">{roll.quantity_initial} {roll.unit_name || 'm'}</td>
-                    <td className="px-3 py-2.5 text-right font-semibold text-blue-600">
-                      {Number(roll.quantity_remaining).toFixed(2)} {roll.unit_name || 'm'}
-                    </td>
-                    <td className="px-3 py-2.5 text-center">
-                      <span className={`rounded-full px-2 py-1 text-[10px] font-semibold ${
-                        roll.status === 'ACTIVE' ? 'bg-emerald-50 text-emerald-700' : 'bg-slate-100 text-slate-600'
-                      }`}>
-                        {roll.status}
-                      </span>
-                    </td>
-                    <td className="px-3 py-2.5 text-right">
-                      <button
-                        type="button"
-                        onClick={() => setLabelToPrint([{
-                          roll_code: roll.roll_code,
-                          barcode: roll.barcode || roll.roll_code,
-                          fabric_name: roll.fabric_name || 'Chưa phân loại',
-                          color_name: roll.color_name || '',
-                          quantity: String(roll.quantity_remaining),
-                          unit_name: roll.unit_name || 'm',
-                          lot_code: roll.lot_code || '',
-                          inbound_date: roll.inbound_date ? new Date(roll.inbound_date).toLocaleDateString('vi-VN') : '',
-                        }])}
-                        title={`In tem ${roll.roll_code}`}
-                        aria-label={`In tem ${roll.roll_code}`}
-                        className="rounded-lg p-2 text-emerald-700 hover:bg-emerald-50"
-                      >
-                        <Printer className="h-4 w-4" />
-                      </button>
-                      <button type="button" onClick={() => beginEditInventoryRoll(roll)} title={`Sửa ${roll.roll_code}`} className="rounded-lg p-2 text-blue-600 hover:bg-blue-50">
-                        <Pencil className="h-4 w-4" />
-                      </button>
-                    </td>
-                  </tr>
-                ))}
-              </tbody>
-            </table>
           </div>
-          <div className="flex flex-col gap-3 border-t border-slate-100 px-4 py-3 text-xs text-slate-600 sm:flex-row sm:items-center sm:justify-between">
-            <span>
-              Trang {inventoryPage} / {Math.max(1, Math.ceil(inventoryTotal / 50))} ·
-              {' '}{inventoryTotal.toLocaleString('vi-VN')} cuộn
-            </span>
-            <div className="flex items-center justify-end gap-2">
+
+          <div className="flex flex-wrap items-center justify-between gap-2 border-t border-white bg-gradient-to-b from-slate-100 to-slate-300 px-2 py-1.5">
+            <div className="flex flex-wrap items-center gap-1">
+              <span className="mr-1 text-[10px] text-slate-600">
+                Trang {inventoryPage}/{Math.max(1, Math.ceil(inventoryTotal / INVENTORY_PAGE_SIZE))}
+              </span>
               <button
                 type="button"
                 onClick={() => changeInventoryPage(Math.max(1, inventoryPage - 1))}
                 disabled={inventoryLoading || inventoryPage <= 1}
-                className="inline-flex items-center gap-1 rounded-lg border border-slate-200 px-3 py-1.5 disabled:opacity-50"
+                className="flex h-7 items-center border border-slate-400 bg-gradient-to-b from-white to-slate-200 px-1.5 disabled:opacity-50"
+                aria-label="Trang trước"
               >
-                <ChevronLeft className="h-4 w-4" /> Trước
+                <ChevronLeft className="h-3.5 w-3.5" />
               </button>
               <button
                 type="button"
                 onClick={() => changeInventoryPage(inventoryPage + 1)}
-                disabled={inventoryLoading || inventoryPage >= Math.ceil(inventoryTotal / 50)}
-                className="inline-flex items-center gap-1 rounded-lg border border-slate-200 px-3 py-1.5 disabled:opacity-50"
+                disabled={inventoryLoading || inventoryPage >= Math.ceil(inventoryTotal / INVENTORY_PAGE_SIZE)}
+                className="flex h-7 items-center border border-slate-400 bg-gradient-to-b from-white to-slate-200 px-1.5 disabled:opacity-50"
+                aria-label="Trang sau"
               >
-                Sau <ChevronRight className="h-4 w-4" />
+                <ChevronRight className="h-3.5 w-3.5" />
               </button>
+              <span className="mx-1 h-6 border-l border-slate-400" />
+              <button
+                type="button"
+                onClick={handleAddRow}
+                className="flex h-7 items-center gap-1 border border-slate-400 bg-gradient-to-b from-white to-slate-200 px-2 text-[11px] font-semibold text-slate-800 hover:from-slate-50 hover:to-slate-300"
+              >
+                <Plus className="h-3.5 w-3.5" /> Thêm
+              </button>
+              <button
+                type="button"
+                onClick={copySelectedRow}
+                className="flex h-7 items-center gap-1 border border-slate-400 bg-gradient-to-b from-white to-slate-200 px-2 text-[11px] font-semibold text-slate-800 hover:from-slate-50 hover:to-slate-300"
+              >
+                <Copy className="h-3.5 w-3.5" /> Sao chép
+              </button>
+              <button
+                type="button"
+                onClick={printSelectedRow}
+                disabled={!selectedInventoryRoll}
+                title={selectedInventoryRoll ? `In tem ${selectedInventoryRoll.roll_code}` : 'Chọn cuộn trong bảng tồn kho để in tem'}
+                className="flex h-7 items-center gap-1 border border-slate-400 bg-gradient-to-b from-white to-slate-200 px-2 text-[11px] font-semibold text-slate-800 hover:from-slate-50 hover:to-slate-300 disabled:cursor-not-allowed disabled:opacity-50"
+              >
+                <Printer className="h-3.5 w-3.5" /> In tem
+              </button>
+              <span className="ml-1 border-l border-slate-400 pl-2 text-[10px] text-slate-600">
+                {selectedInventoryRoll
+                  ? `Đã chọn ${selectedInventoryRoll.roll_code}`
+                  : `Dòng ${selectedRowIndex + 1} / ${rows.length}`}
+              </span>
             </div>
+            <button
+              type="submit"
+              disabled={loading}
+              className="flex h-8 items-center gap-1.5 border border-blue-800 bg-gradient-to-b from-blue-500 to-blue-700 px-3 text-xs font-bold text-white shadow-sm hover:from-blue-600 hover:to-blue-800 disabled:opacity-50"
+            >
+              <PackagePlus className="h-4 w-4" />
+              <span>{loading ? 'Đang nhập...' : `Xác nhận nhập ${rows.length} cuộn`}</span>
+            </button>
           </div>
-        </section>
-      )}
+        </div>
+        </form>
 
-      {editingInventoryRoll && (
+        {editingInventoryRoll && (
         <div className="fixed inset-0 z-50 flex items-center justify-center overflow-y-auto bg-slate-900/40 p-4">
           <form onSubmit={saveInventoryEdit} className="my-8 w-full max-w-xl space-y-4 rounded-2xl bg-white p-6 shadow-xl">
             <div className="flex items-start justify-between border-b border-slate-100 pb-3">
@@ -953,8 +1115,38 @@ export default function InboundPage() {
           </form>
         </div>
       )}
+      {editingNoteIndex !== null && noteEditorPosition && typeof document !== 'undefined' && createPortal(
+        <div
+          ref={noteEditorRef}
+          className="fixed z-[1100] rounded-md border border-blue-500 bg-white p-2 shadow-xl"
+          style={{
+            top: noteEditorPosition.top,
+            left: noteEditorPosition.left,
+            width: noteEditorPosition.width,
+          }}
+        >
+          <div className="mb-1 text-xs font-semibold text-slate-700">
+            Ghi chú dòng {editingNoteIndex + 1}
+          </div>
+          <textarea
+            ref={noteTextareaRef}
+            aria-label={`Nội dung ghi chú dòng ${editingNoteIndex + 1}`}
+            value={rows[editingNoteIndex]?.note ?? ''}
+            onChange={(event) => handleChangeRow(editingNoteIndex, 'note', event.target.value)}
+            onBlur={() => {
+              window.setTimeout(() => {
+                if (!noteEditorRef.current?.contains(document.activeElement)) {
+                  setEditingNoteIndex(null);
+                }
+              }, 0);
+            }}
+            rows={5}
+            className="w-full resize-y rounded border border-slate-300 px-2 py-1.5 text-sm leading-5 text-slate-900 focus:border-blue-500 focus:outline-hidden focus:ring-1 focus:ring-blue-500"
+          />
+        </div>,
+        document.body,
+      )}
       {labelToPrint && <RollLabelPrinter labels={labelToPrint} onClose={() => setLabelToPrint(null)} />}
-      </div>
     </div>
   );
 }

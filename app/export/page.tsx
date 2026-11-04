@@ -1,15 +1,16 @@
 'use client';
 
 import { useState, useEffect, useRef } from 'react';
-import { Plus, Trash2, CheckCircle2, AlertCircle, RefreshCw, Truck, Table2, Search, ChevronLeft, ChevronRight, History, Pencil, X, ChevronDown } from 'lucide-react';
+import { createPortal } from 'react-dom';
+import { Plus, Trash2, CheckCircle2, AlertCircle, RefreshCw, Truck, Search, ChevronLeft, ChevronRight, Pencil, X, Copy } from 'lucide-react';
 import { FabricRoll } from '@/lib/types';
 import { createCatalogOption } from '@/lib/catalog-client';
-import PageViewToggle, { type PageViewMode } from '../components/PageViewToggle';
 import SearchableCombobox from '../components/SearchableCombobox';
 
 interface ExportRow {
   roll_id: string;
   export_quantity: string;
+  note: string;
 }
 
 interface CustomerOption {
@@ -39,16 +40,19 @@ interface ExportHistoryItem {
 }
 
 export default function ExportPage() {
-  const tableMenuRef = useRef<HTMLDivElement>(null);
   const [rolls, setRolls] = useState<FabricRoll[]>([]);
-  const [rows, setRows] = useState<ExportRow[]>([{ roll_id: '', export_quantity: '' }]);
+  const [rows, setRows] = useState<ExportRow[]>([{ roll_id: '', export_quantity: '', note: '' }]);
+  const [selectedRowIndex, setSelectedRowIndex] = useState(0);
   const [customers, setCustomers] = useState<CustomerOption[]>([]);
   const [customerId, setCustomerId] = useState('');
   const [issueSlip, setIssueSlip] = useState<IssueSlip | null>(null);
-  const [note, setNote] = useState('');
-  const [viewMode, setViewMode] = useState<PageViewMode>('both');
+  const [editingNoteIndex, setEditingNoteIndex] = useState<number | null>(null);
+  const [noteEditorPosition, setNoteEditorPosition] = useState<{ top: number; left: number; width: number } | null>(null);
+  const noteEditorRef = useRef<HTMLDivElement>(null);
+  const noteTextareaRef = useRef<HTMLTextAreaElement>(null);
   const [rollSearch, setRollSearch] = useState('');
   const [selectedRolls, setSelectedRolls] = useState<Record<string, FabricRoll>>({});
+  const [selectedInventoryRollId, setSelectedInventoryRollId] = useState<number | null>(null);
   const [page, setPage] = useState(1);
   const [total, setTotal] = useState(0);
   const pageSize = 50;
@@ -61,34 +65,59 @@ export default function ExportPage() {
   const [historyEditForm, setHistoryEditForm] = useState({ quantity: '', note: '' });
   const [historySaving, setHistorySaving] = useState(false);
   const [historyEditError, setHistoryEditError] = useState('');
-  const [tableSelection, setTableSelection] = useState<'inventory' | 'history'>('history');
-  const [tableMenuOpen, setTableMenuOpen] = useState(false);
+  const [selectedHistoryTransId, setSelectedHistoryTransId] = useState<number | null>(null);
+  const [copyingSelectedRoll, setCopyingSelectedRoll] = useState(false);
+  const [tableSelection, setTableSelection] = useState<'inventory' | 'history'>('inventory');
 
   const [loading, setLoading] = useState(false);
   const [fetching, setFetching] = useState(true);
   const [message, setMessage] = useState<{ type: 'success' | 'error'; text: string } | null>(null);
+  const selectedInventoryRoll = rolls.find((roll) => roll.roll_id === selectedInventoryRollId);
 
   useEffect(() => {
-    if (!tableMenuOpen) return;
+    if (editingNoteIndex === null) return;
 
-    const closeMenuOnOutsideClick = (event: PointerEvent) => {
-      if (event.target instanceof Node && !tableMenuRef.current?.contains(event.target)) {
-        setTableMenuOpen(false);
+    const updatePosition = () => {
+      const anchor = document.getElementById(`export-note-${editingNoteIndex}`);
+      if (!anchor) return;
+      const rect = anchor.getBoundingClientRect();
+      const width = Math.min(360, window.innerWidth - 16);
+      const height = 180;
+      const left = Math.max(8, Math.min(rect.left, window.innerWidth - width - 8));
+      const top = rect.bottom + height + 8 <= window.innerHeight
+        ? rect.bottom + 4
+        : Math.max(8, rect.top - height - 4);
+      setNoteEditorPosition({ top, left, width });
+    };
+
+    updatePosition();
+    window.requestAnimationFrame(() => noteTextareaRef.current?.focus());
+    window.addEventListener('resize', updatePosition);
+    window.addEventListener('scroll', updatePosition, true);
+
+    const closeOnOutsideClick = (event: PointerEvent) => {
+      const target = event.target;
+      const anchor = document.getElementById(`export-note-${editingNoteIndex}`);
+      if (target instanceof Node && !noteEditorRef.current?.contains(target) && !anchor?.contains(target)) {
+        setEditingNoteIndex(null);
       }
     };
-    const closeMenuOnEscape = (event: KeyboardEvent) => {
-      if (event.key === 'Escape') setTableMenuOpen(false);
+    const closeOnEscape = (event: KeyboardEvent) => {
+      if (event.key === 'Escape') setEditingNoteIndex(null);
     };
 
-    document.addEventListener('pointerdown', closeMenuOnOutsideClick);
-    document.addEventListener('keydown', closeMenuOnEscape);
+    document.addEventListener('pointerdown', closeOnOutsideClick);
+    document.addEventListener('keydown', closeOnEscape);
     return () => {
-      document.removeEventListener('pointerdown', closeMenuOnOutsideClick);
-      document.removeEventListener('keydown', closeMenuOnEscape);
+      window.removeEventListener('resize', updatePosition);
+      window.removeEventListener('scroll', updatePosition, true);
+      document.removeEventListener('pointerdown', closeOnOutsideClick);
+      document.removeEventListener('keydown', closeOnEscape);
     };
-  }, [tableMenuOpen]);
+  }, [editingNoteIndex]);
 
   const fetchRolls = async (targetPage = page, searchTerm = rollSearch) => {
+    setSelectedInventoryRollId(null);
     setFetching(true);
     try {
       const params = new URLSearchParams({
@@ -164,12 +193,22 @@ export default function ExportPage() {
   }, []);
 
   const handleAddRow = () => {
-    setRows([...rows, { roll_id: '', export_quantity: '' }]);
+    setSelectedInventoryRollId(null);
+    setSelectedRowIndex(rows.length);
+    setRows([...rows, { roll_id: '', export_quantity: '', note: '' }]);
   };
 
   const handleRemoveRow = (index: number) => {
     if (rows.length === 1) return;
     setRows(rows.filter((_, i) => i !== index));
+    setEditingNoteIndex((current) => {
+      if (current === index) return null;
+      return current !== null && current > index ? current - 1 : current;
+    });
+    setSelectedRowIndex((current) => {
+      if (current === index) return Math.max(0, index - 1);
+      return current > index ? current - 1 : current;
+    });
   };
 
   const handleChangeRow = (index: number, field: keyof ExportRow, value: string) => {
@@ -178,10 +217,114 @@ export default function ExportPage() {
     setRows(updated);
   };
 
+  const copySelectedRow = () => {
+    const roll = selectedInventoryRoll
+      || rolls.find((item) => String(item.roll_id) === rows[selectedRowIndex]?.roll_id)
+      || selectedRolls[rows[selectedRowIndex]?.roll_id];
+    if (!roll) {
+      setMessage({ type: 'error', text: 'Vui lòng chọn một cuộn tồn kho để sao chép vào danh sách xuất.' });
+      return;
+    }
+
+    const rollId = String(roll.roll_id);
+    const currentRow = rows[selectedRowIndex];
+    const targetIndex = currentRow && !currentRow.roll_id && !currentRow.export_quantity
+      ? selectedRowIndex
+      : rows.length;
+    setSelectedRolls((current) => ({ ...current, [rollId]: roll }));
+    setRows(targetIndex === rows.length
+      ? [...rows, { roll_id: rollId, export_quantity: '', note: '' }]
+      : rows.map((row, index) => index === targetIndex ? { roll_id: rollId, export_quantity: '', note: '' } : row));
+    setSelectedInventoryRollId(null);
+    setSelectedRowIndex(targetIndex);
+    setMessage({
+      type: 'success',
+      text: `Đã đưa cuộn ${roll.roll_code} vào dòng xuất ${targetIndex + 1}. Nhập số lượng cần xuất.`,
+    });
+  };
+
+  const copySelectedHistoryRoll = async () => {
+    const historyItem = exportHistory.find((item) => item.trans_id === selectedHistoryTransId);
+    if (!historyItem) {
+      setMessage({ type: 'error', text: 'Vui lòng chọn một giao dịch trong lịch sử xuất kho để sao chép.' });
+      return;
+    }
+
+    setCopyingSelectedRoll(true);
+    setMessage(null);
+    try {
+      const params = new URLSearchParams({
+        status: 'ACTIVE',
+        search: historyItem.roll_code,
+        page: '1',
+        pageSize: '100',
+      });
+      const response = await fetch(`/api/inventory?${params}`);
+      const json = await response.json();
+      if (!response.ok || !json.success) {
+        throw new Error(json.error || 'Không thể kiểm tra tồn kho của cuộn đã chọn.');
+      }
+      const roll = (json.data as FabricRoll[]).find((item) => item.roll_code === historyItem.roll_code);
+      if (!roll) {
+        setMessage({
+          type: 'error',
+          text: `Cuộn ${historyItem.roll_code} hiện không còn tồn kho khả dụng để xuất.`,
+        });
+        return;
+      }
+
+      const rollId = String(roll.roll_id);
+      const currentRow = rows[selectedRowIndex];
+      const targetIndex = currentRow && !currentRow.roll_id && !currentRow.export_quantity
+        ? selectedRowIndex
+        : rows.length;
+      setSelectedRolls((current) => ({ ...current, [rollId]: roll }));
+      setRows(targetIndex === rows.length
+        ? [...rows, { roll_id: rollId, export_quantity: '', note: '' }]
+        : rows.map((row, index) => index === targetIndex ? { roll_id: rollId, export_quantity: '', note: '' } : row));
+      setSelectedHistoryTransId(null);
+      setSelectedRowIndex(targetIndex);
+      setMessage({
+        type: 'success',
+        text: `Đã đưa cuộn ${roll.roll_code} vào dòng xuất ${targetIndex + 1}. Nhập số lượng cần xuất.`,
+      });
+    } catch (error) {
+      console.error('Lỗi sao chép cuộn từ lịch sử xuất kho:', error);
+      setMessage({
+        type: 'error',
+        text: error instanceof Error ? error.message : 'Không thể sao chép cuộn từ lịch sử xuất kho.',
+      });
+    } finally {
+      setCopyingSelectedRoll(false);
+    }
+  };
+
+  const handleCopySelectedRow = () => {
+    if (tableSelection === 'history' && selectedHistoryTransId !== null) {
+      void copySelectedHistoryRoll();
+      return;
+    }
+    copySelectedRow();
+  };
+
   const handleSubmit = async (e: React.FormEvent) => {
     e.preventDefault();
     if (!customerId) {
       setMessage({ type: 'error', text: 'Vui lòng chọn khách hàng nhận vải.' });
+      return;
+    }
+    const invalidRowIndex = rows.findIndex((row) => {
+      const quantity = Number(row.export_quantity);
+      const roll = rolls.find((item) => String(item.roll_id) === row.roll_id) || selectedRolls[row.roll_id];
+      return !row.roll_id || !Number.isFinite(quantity) || quantity <= 0 || !roll || quantity > Number(roll.quantity_remaining);
+    });
+    if (invalidRowIndex !== -1) {
+      setSelectedRowIndex(invalidRowIndex);
+      setSelectedInventoryRollId(null);
+      setMessage({
+        type: 'error',
+        text: `Kiểm tra lại cuộn và số lượng xuất ở dòng ${invalidRowIndex + 1}. Số lượng phải lớn hơn 0 và không vượt tồn kho.`,
+      });
       return;
     }
     setLoading(true);
@@ -194,6 +337,7 @@ export default function ExportPage() {
         return {
           roll_id: Number(row.roll_id),
           export_quantity: Number(row.export_quantity),
+          note: row.note.trim(),
           label: {
             code: roll?.roll_code || '',
             fabric: roll?.fabric_name || '',
@@ -206,7 +350,7 @@ export default function ExportPage() {
       const payload = {
         items: submittedItems.map(({ label: _label, ...item }) => item),
         customer_id: Number(customerId),
-        note: note.trim() || undefined,
+        note: rows[0]?.note.trim() || undefined,
       };
 
       const res = await fetch('/api/export', {
@@ -223,13 +367,14 @@ export default function ExportPage() {
           code: json.data.order_code,
           customer: selectedCustomer?.customer_name || '',
           date: new Date().toLocaleString('vi-VN'),
-          note: note.trim(),
+          note: rows.map((row, index) => row.note.trim() ? `Dòng ${index + 1}: ${row.note.trim()}` : '').filter(Boolean).join('\n'),
           items: submittedItems.map((item) => item.label),
         });
-        setRows([{ roll_id: '', export_quantity: '' }]);
-        setNote('');
-        fetchRolls();
-        fetchExportHistory(1);
+        setRows([{ roll_id: '', export_quantity: '', note: '' }]);
+        setSelectedRowIndex(0);
+        setEditingNoteIndex(null);
+        setSelectedRolls({});
+        await Promise.all([fetchRolls(1), fetchExportHistory(1)]);
       } else {
         setMessage({ type: 'error', text: json.error || 'Có lỗi xảy ra khi xuất kho.' });
       }
@@ -296,23 +441,11 @@ export default function ExportPage() {
   };
 
   return (
-    <div className="max-w-screen-2xl mx-auto space-y-6">
-      <div className="flex flex-col gap-4 xl:flex-row xl:items-end xl:justify-between">
+    <div className="mx-auto max-w-screen-2xl space-y-4">
+      <div className="flex flex-col gap-3 border border-slate-400 bg-gradient-to-b from-slate-100 to-slate-300 px-3 py-2 shadow-sm xl:flex-row xl:items-center xl:justify-between">
         <div>
-          <h1 className="text-2xl font-bold text-slate-900">Xuất Kho Vải Hàng Loạt</h1>
-          <p className="text-sm text-slate-500 mt-0.5">Tạo phiếu lãnh vải theo khách hàng và ghi nhận xuất kho</p>
-        </div>
-        <div className="flex flex-col gap-3 sm:flex-row sm:items-center">
-          <PageViewToggle mode={viewMode} onChange={setViewMode} />
-          <button
-            type="button"
-            onClick={() => fetchRolls()}
-            disabled={fetching}
-            className="flex items-center gap-2 px-3 py-2 bg-white border border-slate-200 rounded-lg text-sm font-medium text-slate-700 hover:bg-slate-50 transition-colors shadow-xs"
-          >
-            <RefreshCw className={`w-4 h-4 ${fetching ? 'animate-spin' : ''}`} />
-            <span>Làm mới danh sách</span>
-          </button>
+          <h1 className="text-sm font-bold text-slate-900">Xuất kho vải</h1>
+          <p className="mt-0.5 text-[11px] text-slate-600">Xuất danh sách cuộn vải theo khách hàng</p>
         </div>
       </div>
 
@@ -354,46 +487,88 @@ export default function ExportPage() {
         </div>
       )}
 
-      <div className={viewMode === 'both' ? 'grid grid-cols-1 items-stretch gap-6 xl:grid-cols-2' : 'space-y-6'}>
-      {viewMode !== 'table' && <form onSubmit={handleSubmit} className="min-w-0 space-y-6">
-        <div className="bg-white border border-slate-200 rounded-2xl p-6 shadow-xs space-y-4">
-          <div className="flex items-center justify-between pb-4 border-b border-slate-100">
-            <h2 className="font-semibold text-slate-900 text-base">Danh sách cuộn xuất kho ({rows.length})</h2>
-            <button
-              type="button"
-              onClick={handleAddRow}
-              className="flex items-center gap-1.5 px-3 py-1.5 bg-rose-50 text-rose-600 hover:bg-rose-100 rounded-lg text-xs font-semibold transition-colors"
-            >
-              <Plus className="w-4 h-4" /> Thêm cuộn
-            </button>
+      <div className="flex flex-col gap-0">
+      <form onSubmit={handleSubmit} className="order-2 min-w-0 border-x border-b border-slate-400 bg-[#f5f5f5] shadow-md">
+        <div>
+          <div className="flex flex-wrap items-center justify-between gap-x-2 gap-y-1 border-b border-slate-400 bg-gradient-to-b from-white to-slate-200 px-2 py-1">
+            <div className="flex flex-wrap items-center gap-2">
+              <h2 className="text-[11px] font-bold uppercase text-slate-800">
+                Dòng mới — chỉ các dòng cuộn bên dưới sẽ được xuất kho
+              </h2>
+              <span className="border border-slate-400 bg-white px-1.5 py-0.5 text-[10px] font-semibold text-slate-700">
+                {rows.length} dòng mới
+              </span>
+            </div>
           </div>
 
-          <label className="block space-y-1 text-xs font-semibold text-slate-700">
-            Khách hàng nhận vải <span className="text-rose-500">*</span>
-            <SearchableCombobox
-              required
-              ariaLabel="Khách hàng nhận vải"
-              value={customerId}
-              onChange={setCustomerId}
-              options={customers.map((customer) => ({
-                value: String(customer.customer_id),
-                label: `${customer.customer_name} (${customer.customer_code})`,
-              }))}
-              placeholder="Tìm khách hàng..."
-              createFields={[{ name: 'code', label: 'Mã khách hàng', required: true }]}
-              onCreateOption={addCustomer}
-            />
-          </label>
-
-          <div className="space-y-3">
+          <div className="w-full min-w-0 overflow-hidden border-b border-slate-400 bg-white">
+            <div className="min-w-0">
+              <div className="max-h-[36vh] overflow-y-auto">
+                <table className="w-full table-fixed border-collapse text-left text-[11px]">
+                  <colgroup>
+                    <col className="w-[3%]" />
+                    <col className="w-[15%]" />
+                    <col className="w-[21%]" />
+                    <col className="w-[10%]" />
+                    <col className="w-[8%]" />
+                    <col className="w-[10%]" />
+                    <col className="w-[11%]" />
+                    <col className="w-[18%]" />
+                    <col className="w-[4%]" />
+                  </colgroup>
+                  <thead className="sticky top-0 z-10 bg-gradient-to-b from-slate-100 to-slate-300 text-[10px] font-semibold uppercase text-slate-700">
+                    <tr>
+                      <th className="border border-slate-400 px-1 py-1.5">#</th>
+                      <th className="border border-slate-400 px-1 py-1.5">Khách hàng *</th>
+                      <th className="border border-slate-400 px-1 py-1.5">Mã cuộn *</th>
+                      <th className="border border-slate-400 px-1 py-1.5">Loại vải</th>
+                      <th className="border border-slate-400 px-1 py-1.5">Vị trí</th>
+                      <th className="border border-slate-400 px-1 py-1.5 text-right">Tồn hiện tại</th>
+                      <th className="border border-slate-400 px-1 py-1.5">Số lượng xuất *</th>
+                      <th className="border border-slate-400 px-1 py-1.5">Ghi chú</th>
+                      <th className="border border-slate-400 px-1 py-1.5" />
+                    </tr>
+                  </thead>
+                  <tbody>
             {rows.map((row, index) => {
               const selectedRoll = rolls.find((r) => String(r.roll_id) === row.roll_id) || selectedRolls[row.roll_id];
               const maxQty = selectedRoll ? Number(selectedRoll.quantity_remaining) : 0;
 
               return (
-                <div key={index} className="flex items-center gap-3 p-3 bg-slate-50 border border-slate-200 rounded-xl">
-                  <span className="text-xs font-bold text-slate-500 w-8">#{index + 1}</span>
-                  <div className="flex-1">
+                <tr
+                  key={index}
+                  onClick={() => {
+                    setSelectedRowIndex(index);
+                    setSelectedInventoryRollId(null);
+                  }}
+                  onFocusCapture={() => {
+                    setSelectedRowIndex(index);
+                    setSelectedInventoryRollId(null);
+                  }}
+                  className={selectedRowIndex === index && !selectedInventoryRollId ? 'bg-[#dbeafe]' : index % 2 === 0 ? 'bg-white' : 'bg-[#f7f7f7]'}
+                >
+                  <td className="border border-slate-300 px-1 py-1 text-center text-slate-500">{index + 1}</td>
+                  {index === 0 && (
+                    <td rowSpan={rows.length} className="align-top border border-slate-300 px-1 py-1">
+                      <SearchableCombobox
+                        required
+                        ariaLabel="Khách hàng nhận vải"
+                        value={customerId}
+                        onChange={setCustomerId}
+                        options={customers.map((customer) => ({
+                          value: String(customer.customer_id),
+                          label: `${customer.customer_name} (${customer.customer_code})`,
+                        }))}
+                        placeholder="Khách hàng nhận vải *"
+                        createFields={[{ name: 'code', label: 'Mã khách hàng', required: true }]}
+                        onCreateOption={addCustomer}
+                        showSearchIcon={false}
+                        showChevron={false}
+                        className="!h-7 !w-full !rounded-none !border-slate-300 !py-1 !pl-2 !pr-2 !text-[12px] !font-medium !text-slate-900 placeholder:!text-slate-500"
+                      />
+                    </td>
+                  )}
+                  <td className="border border-slate-300 px-1 py-1">
                     <SearchableCombobox
                       required
                       ariaLabel={`Cuộn xuất kho số ${index + 1}`}
@@ -411,11 +586,17 @@ export default function ExportPage() {
                         value: String(roll.roll_id),
                         label: `${roll.roll_code} | ${roll.fabric_name || 'Vải'}${roll.stock_type === 'SAVING' ? ' (Vải tiết kiệm)' : ''} - Tồn: ${roll.quantity_remaining}${roll.unit_name || 'm'} (Kệ: ${roll.location_code || 'Chưa xếp'})`,
                       }))}
-                      className="py-2 pl-9 pr-9 text-xs focus:border-rose-500 focus:ring-rose-100"
+                      showSearchIcon={false}
+                      showChevron={false}
+                      className="!h-7 !rounded-none !border-slate-300 !py-1 !pl-2 !pr-2 !text-[12px] !font-medium !text-slate-900 placeholder:!text-slate-500"
                     />
-                  </div>
-
-                  <div className="w-48">
+                  </td>
+                  <td className="border border-slate-300 px-2 py-1 text-slate-700">{selectedRoll?.fabric_name || '—'}</td>
+                  <td className="border border-slate-300 px-2 py-1 text-slate-700">{selectedRoll?.location_code || selectedRoll?.location_name || '—'}</td>
+                  <td className="border border-slate-300 px-2 py-1 text-right text-slate-700">
+                    {selectedRoll ? `${Number(selectedRoll.quantity_remaining).toFixed(2)} ${selectedRoll.unit_name || 'm'}` : '—'}
+                  </td>
+                  <td className="border border-slate-300 px-1 py-1">
                     <input
                       type="number"
                       step="0.01"
@@ -424,96 +605,162 @@ export default function ExportPage() {
                       max={maxQty || undefined}
                       value={row.export_quantity}
                       onChange={(e) => handleChangeRow(index, 'export_quantity', e.target.value)}
-                      placeholder={`SL xuất (Tồn: ${maxQty})`}
-                      className="w-full px-3 py-2 bg-white border border-slate-300 rounded-lg text-xs text-slate-900 focus:outline-hidden focus:ring-2 focus:ring-rose-500"
+                      aria-label={`Số lượng xuất dòng ${index + 1}`}
+                      placeholder="0.00"
+                      className="h-7 w-full border border-slate-300 bg-white px-1 text-right text-[12px] font-medium text-slate-900 placeholder:text-slate-500"
                     />
-                  </div>
-
-                  {rows.length > 1 && (
+                  </td>
+                  <td className="border border-slate-300 px-1 py-1">
+                    <input
+                      id={`export-note-${index}`}
+                      type="text"
+                      readOnly
+                      aria-label={`Ghi chú dòng ${index + 1}`}
+                      value={row.note}
+                      onFocus={() => setEditingNoteIndex(index)}
+                      onClick={() => setEditingNoteIndex(index)}
+                      placeholder="Ghi chú"
+                      title={row.note}
+                      className="h-7 w-full min-w-0 cursor-text border border-slate-300 bg-white px-1 text-[11px] font-medium leading-5 text-slate-900 placeholder:text-slate-500"
+                    />
+                  </td>
+                  <td className="border border-slate-300 px-1 py-1 text-center">
                     <button
                       type="button"
                       onClick={() => handleRemoveRow(index)}
-                      className="text-rose-500 hover:text-rose-700 p-2 transition-colors"
-                      title="Xóa dòng"
+                      disabled={rows.length === 1}
+                      aria-label={`Xóa dòng xuất ${index + 1}`}
+                      title={rows.length === 1 ? 'Cần ít nhất một dòng xuất kho' : 'Xóa dòng'}
+                      className="text-rose-500 hover:text-rose-700 disabled:cursor-not-allowed disabled:opacity-30"
                     >
-                      <Trash2 className="w-4 h-4" />
+                      <Trash2 className="mx-auto h-4 w-4" />
                     </button>
-                  )}
-                </div>
+                  </td>
+                </tr>
               );
             })}
+                  </tbody>
+                </table>
+              </div>
+            </div>
           </div>
 
-          <div>
-            <label className="block text-xs font-semibold text-slate-700 uppercase tracking-wider mb-1.5">Ghi chú phiếu xuất kho / Khách hàng</label>
-            <textarea
-              rows={2}
-              value={note}
-              onChange={(e) => setNote(e.target.value)}
-              placeholder="VD: Xuất bán đơn hàng KH-8892..."
-              className="w-full px-3.5 py-2.5 bg-slate-50 border border-slate-300 rounded-lg text-sm text-slate-900 focus:outline-hidden focus:ring-2 focus:ring-rose-500"
-            />
-          </div>
-
-          <div className="flex justify-end pt-4 border-t border-slate-100">
+          <div className="flex flex-nowrap items-center justify-between gap-2 border-t border-white bg-gradient-to-b from-slate-100 to-slate-300 px-2 py-1.5">
+            <div className="flex min-w-0 flex-nowrap items-center gap-1 overflow-hidden">
+              <span className="mr-1 shrink-0 text-[10px] text-slate-600">
+                Trang {tableSelection === 'inventory' ? page : historyPage}/{Math.max(1, tableSelection === 'inventory' ? totalPages : historyTotalPages)}
+              </span>
+              <button
+                type="button"
+                onClick={() => {
+                  if (tableSelection === 'inventory') changePage(Math.max(1, page - 1));
+                  else {
+                    const next = Math.max(1, historyPage - 1);
+                    setHistoryPage(next);
+                    void fetchExportHistory(next);
+                  }
+                }}
+                disabled={tableSelection === 'inventory' ? fetching || page <= 1 : historyLoading || historyPage <= 1}
+                className="flex h-7 shrink-0 items-center border border-slate-400 bg-gradient-to-b from-white to-slate-200 px-1.5 disabled:opacity-50"
+                aria-label="Trang trước"
+              >
+                <ChevronLeft className="h-3.5 w-3.5" />
+              </button>
+              <button
+                type="button"
+                onClick={() => {
+                  if (tableSelection === 'inventory') changePage(page + 1);
+                  else {
+                    const next = historyPage + 1;
+                    setHistoryPage(next);
+                    void fetchExportHistory(next);
+                  }
+                }}
+                disabled={tableSelection === 'inventory' ? fetching || page >= totalPages : historyLoading || historyPage >= historyTotalPages}
+                className="flex h-7 shrink-0 items-center border border-slate-400 bg-gradient-to-b from-white to-slate-200 px-1.5 disabled:opacity-50"
+                aria-label="Trang sau"
+              >
+                <ChevronRight className="h-3.5 w-3.5" />
+              </button>
+              <span className="mx-1 h-6 shrink-0 border-l border-slate-400" />
+              <button
+                type="button"
+                onClick={handleAddRow}
+                className="flex h-7 shrink-0 items-center gap-1 border border-slate-400 bg-gradient-to-b from-white to-slate-200 px-2 text-[11px] font-semibold text-slate-800 hover:to-slate-300"
+              >
+                <Plus className="h-3.5 w-3.5" /> Thêm
+              </button>
+              <button
+                type="button"
+                onClick={handleCopySelectedRow}
+                disabled={copyingSelectedRoll}
+                className="flex h-7 shrink-0 items-center gap-1 border border-slate-400 bg-gradient-to-b from-white to-slate-200 px-2 text-[11px] font-semibold text-slate-800 hover:to-slate-300 disabled:opacity-50"
+              >
+                <Copy className="h-3.5 w-3.5" /> Sao chép
+              </button>
+              <span className="ml-1 shrink-0 border-l border-slate-400 pl-2 text-[10px] text-slate-600">
+                Dòng {selectedRowIndex + 1} / {rows.length}
+              </span>
+            </div>
             <button
               type="submit"
               disabled={loading}
-              className="flex items-center gap-2 px-6 py-2.5 bg-rose-600 hover:bg-rose-700 text-white rounded-lg text-sm font-semibold transition-colors shadow-xs disabled:opacity-50"
+              className="flex h-8 shrink-0 items-center justify-center gap-1.5 border border-rose-800 bg-gradient-to-b from-rose-500 to-rose-700 px-3 text-xs font-bold text-white shadow-sm hover:from-rose-600 hover:to-rose-800 disabled:opacity-50"
             >
-              <Truck className="w-4 h-4" />
-              <span>{loading ? 'Đang xử lý Transaction...' : `Xác Nhận Xuất ${rows.length} Cuộn`}</span>
+              <Truck className="h-3.5 w-3.5" />
+              <span>{loading ? 'Đang xuất...' : `Xác nhận xuất ${rows.length} cuộn`}</span>
             </button>
           </div>
         </div>
-      </form>}
+      </form>
 
-      {viewMode !== 'entry' && tableSelection === 'inventory' && (
-        <section className="flex h-full min-w-0 flex-col overflow-hidden rounded-2xl border border-slate-200 bg-white shadow-xs">
-          <div className="flex flex-col gap-3 border-b border-slate-100 p-4 sm:flex-row sm:items-center sm:justify-between">
-            <div className="flex items-center gap-3">
-              <Table2 className="h-5 w-5 shrink-0 text-blue-600" />
-              <div ref={tableMenuRef} className="relative">
+      {tableSelection === 'inventory' && (
+        <section className="order-1 flex h-full min-w-0 flex-col overflow-hidden border border-slate-400 bg-white shadow-sm">
+          <div className="flex flex-col gap-2 border-b border-slate-400 bg-gradient-to-b from-white to-slate-200 px-2 py-1.5 sm:flex-row sm:items-center sm:justify-between">
+            <div className="min-w-0">
+              <div role="tablist" aria-label="Bảng xuất kho" className="flex flex-nowrap items-end gap-1">
                 <button
                   type="button"
-                  aria-haspopup="listbox"
-                  aria-expanded={tableMenuOpen}
-                  aria-label={`Bảng đang xem: Tồn kho có thể xuất (${total.toLocaleString('vi-VN')} cuộn). Chọn bảng`}
-                  onClick={() => setTableMenuOpen((open) => !open)}
-                  className="inline-flex max-w-full items-center gap-2 rounded-md py-1 text-left text-base font-semibold text-slate-900 transition-colors hover:text-blue-700 focus-visible:outline-hidden focus-visible:ring-2 focus-visible:ring-blue-500"
+                  role="tab"
+                  aria-selected={tableSelection === 'inventory'}
+                  onClick={() => { setTableSelection('inventory'); setSelectedHistoryTransId(null); setSelectedInventoryRollId(null); }}
+                  className={`shrink-0 border px-2.5 py-1.5 text-[11px] focus-visible:outline-hidden focus-visible:ring-2 focus-visible:ring-blue-500 ${
+                    tableSelection === 'inventory'
+                      ? 'relative z-10 -mb-px border-slate-400 border-b-white bg-white font-semibold text-slate-900'
+                      : 'border-slate-300 bg-slate-200 text-slate-700 hover:bg-slate-100'
+                  }`}
                 >
-                  <span className="truncate">Tồn kho có thể xuất ({total.toLocaleString('vi-VN')} cuộn)</span>
-                  <ChevronDown className={`h-4 w-4 shrink-0 text-slate-500 transition-transform ${tableMenuOpen ? 'rotate-180' : ''}`} />
+                  Tồn kho có thể xuất ({total.toLocaleString('vi-VN')})
                 </button>
-                {tableMenuOpen && (
-                  <div role="listbox" aria-label="Chọn bảng hiển thị" className="absolute left-0 top-full z-30 mt-2 min-w-56 overflow-hidden rounded-xl border border-slate-200 bg-white p-1.5 shadow-lg">
-                    <button type="button" role="option" aria-selected onClick={() => { setTableSelection('inventory'); setTableMenuOpen(false); }} className="flex w-full items-center gap-2.5 rounded-lg bg-blue-50 px-3 py-2.5 text-left text-sm font-semibold text-blue-700">
-                      <Table2 className="h-4 w-4 shrink-0" /> Tồn kho có thể xuất
-                    </button>
-                    <button type="button" role="option" aria-selected={false} onClick={() => { setTableSelection('history'); setTableMenuOpen(false); }} className="flex w-full items-center gap-2.5 rounded-lg px-3 py-2.5 text-left text-sm text-slate-700 hover:bg-slate-50">
-                      <History className="h-4 w-4 shrink-0" /> Lịch sử xuất kho ({historyTotal.toLocaleString('vi-VN')})
-                    </button>
-                  </div>
-                )}
-                <p className="mt-1 text-xs text-slate-500">Danh sách cuộn đang còn hàng</p>
+                <button
+                  type="button"
+                  role="tab"
+                  aria-selected={false}
+                  onClick={() => { setTableSelection('history'); setSelectedInventoryRollId(null); }}
+                  className="shrink-0 border border-slate-300 bg-slate-200 px-2.5 py-1.5 text-[11px] text-slate-700 hover:bg-slate-100 focus-visible:outline-hidden focus-visible:ring-2 focus-visible:ring-blue-500"
+                >
+                  Lịch sử xuất kho ({historyTotal.toLocaleString('vi-VN')})
+                </button>
               </div>
+              <p className="mt-1 text-[10px] text-slate-600">Chọn cuộn trong danh sách để sao chép vào dòng xuất kho</p>
             </div>
-            <div className="flex min-w-0 flex-col gap-2 sm:flex-row">
+            <div className="flex min-w-0 items-center gap-1.5">
               <div className="relative min-w-0 flex-1">
-                <Search className="absolute left-2.5 top-1/2 h-3.5 w-3.5 -translate-y-1/2 text-slate-400" />
+                <Search className="absolute left-2 top-1/2 h-3.5 w-3.5 -translate-y-1/2 text-slate-400" />
                 <input
                   value={rollSearch}
                   onChange={(event) => setRollSearch(event.target.value)}
                   onKeyDown={(event) => event.key === 'Enter' && searchRolls()}
-                  placeholder="Tìm mã cuộn, barcode, tên vải..."
-                  className="w-full rounded-lg border border-slate-200 py-2 pl-8 pr-2 text-xs"
+                  placeholder="Tìm cuộn đã có..."
+                  aria-label="Tìm cuộn tồn kho có thể xuất"
+                  className="h-7 w-full min-w-0 border border-slate-400 bg-white pl-7 pr-2 text-[11px] text-slate-900 shadow-inner focus:border-blue-600 focus:outline-hidden focus:ring-1 focus:ring-blue-500"
                 />
               </div>
               <button
                 type="button"
                 onClick={searchRolls}
                 disabled={fetching}
-                className="rounded-lg border border-slate-200 px-3 py-2 text-xs font-medium text-slate-700 disabled:opacity-50"
+                className="h-7 shrink-0 border border-slate-400 bg-gradient-to-b from-white to-slate-200 px-2 text-[11px] font-semibold text-slate-800 disabled:opacity-50"
               >
                 Tìm
               </button>
@@ -521,162 +768,177 @@ export default function ExportPage() {
                 type="button"
                 onClick={() => fetchRolls()}
                 disabled={fetching}
-                className="flex shrink-0 items-center gap-2 rounded-lg border border-slate-200 px-3 py-2 text-xs font-medium text-slate-700 transition-colors hover:bg-slate-50 disabled:opacity-50"
+                className="flex h-7 shrink-0 items-center gap-1 border border-slate-400 bg-gradient-to-b from-white to-slate-200 px-2 text-[11px] font-semibold text-slate-800 hover:to-slate-300 disabled:opacity-50"
               >
                 <RefreshCw className={`h-3.5 w-3.5 ${fetching ? 'animate-spin' : ''}`} />
                 Làm mới
               </button>
             </div>
           </div>
-          <div className="max-h-[75vh] flex-1 overflow-auto">
-            <table className="w-full min-w-[640px] text-left text-xs">
-              <thead className="sticky top-0 z-10 border-b border-slate-200 bg-slate-50 text-[11px] font-semibold uppercase text-slate-600">
+          <div className="max-h-[54vh] flex-1 overflow-auto">
+            <table className="w-full min-w-[700px] border-collapse text-left text-[11px]">
+              <thead className="sticky top-0 z-10 bg-gradient-to-b from-slate-100 to-slate-300 text-[10px] font-semibold uppercase text-slate-700">
                 <tr>
-                  <th className="px-3 py-3">Mã cuộn</th>
-                  <th className="px-3 py-3">Vải</th>
-                  <th className="px-3 py-3">Vị trí</th>
-                  <th className="px-3 py-3 text-right">Ban đầu</th>
-                  <th className="px-3 py-3 text-right">Còn lại</th>
-                  <th className="px-3 py-3 text-center">Trạng thái</th>
+                  <th className="border border-slate-400 px-1 py-1.5">#</th>
+                  <th className="border border-slate-400 px-1 py-1.5">Mã cuộn</th>
+                  <th className="border border-slate-400 px-1 py-1.5">Loại vải</th>
+                  <th className="border border-slate-400 px-1 py-1.5">Vị trí kệ</th>
+                  <th className="border border-slate-400 px-1 py-1.5 text-right">Số lượng ban đầu</th>
+                  <th className="border border-slate-400 px-1 py-1.5 text-right">Còn lại</th>
                 </tr>
               </thead>
-              <tbody className="divide-y divide-slate-100">
+              <tbody>
                 {fetching ? (
-                  <tr><td colSpan={6} className="py-10 text-center text-slate-400">Đang tải tồn kho...</td></tr>
+                  <tr><td colSpan={6} className="border border-slate-300 py-8 text-center text-slate-500">Đang tải tồn kho...</td></tr>
                 ) : rolls.length === 0 ? (
-                  <tr><td colSpan={6} className="py-10 text-center text-slate-400">Không có cuộn nào còn hàng.</td></tr>
-                ) : rolls.map((roll) => (
-                  <tr key={roll.roll_id} className="hover:bg-slate-50">
-                    <td className="px-3 py-2.5">
+                  <tr><td colSpan={6} className="border border-slate-300 py-8 text-center text-slate-500">Không có cuộn nào còn hàng.</td></tr>
+                ) : rolls.map((roll, index) => (
+                  <tr
+                    key={roll.roll_id}
+                    onClick={() => setSelectedInventoryRollId(roll.roll_id)}
+                    onKeyDown={(event) => {
+                      if (event.key === 'Enter' || event.key === ' ') {
+                        event.preventDefault();
+                        setSelectedInventoryRollId(roll.roll_id);
+                      }
+                    }}
+                    tabIndex={0}
+                    aria-selected={selectedInventoryRollId === roll.roll_id}
+                    aria-label={`Chọn cuộn ${roll.roll_code} để xuất`}
+                    className={`cursor-pointer focus:outline-hidden focus:ring-2 focus:ring-inset focus:ring-blue-500 ${
+                      selectedInventoryRollId === roll.roll_id
+                        ? 'bg-[#dbeafe]'
+                        : index % 2 === 0 ? 'bg-white hover:bg-slate-50' : 'bg-[#f7f7f7] hover:bg-slate-50'
+                    }`}
+                  >
+                    <td className="border border-slate-300 px-2 py-1.5 text-center text-slate-500">{(page - 1) * pageSize + index + 1}</td>
+                    <td className="border border-slate-300 px-2 py-1.5">
                       <div className="font-semibold text-slate-900">{roll.roll_code}</div>
-                      <div className="mt-0.5 text-[10px] text-slate-400">{roll.barcode || 'Chưa có barcode'}</div>
+                      <div className="mt-0.5 text-[10px] text-slate-500">{roll.barcode || 'Chưa có barcode'}</div>
                     </td>
-                    <td className="px-3 py-2.5 text-slate-700">{roll.fabric_name || 'Chưa phân loại'}</td>
-                    <td className="px-3 py-2.5 text-slate-600">{roll.location_code || roll.location_name || 'Chưa xếp kệ'}</td>
-                    <td className="px-3 py-2.5 text-right text-slate-600">{roll.quantity_initial} {roll.unit_name || 'm'}</td>
-                    <td className="px-3 py-2.5 text-right font-semibold text-blue-600">
+                    <td className="border border-slate-300 px-2 py-1.5 text-slate-700">{roll.fabric_name || 'Chưa phân loại'}</td>
+                    <td className="border border-slate-300 px-2 py-1.5 text-slate-600">{roll.location_code || roll.location_name || 'Chưa xếp kệ'}</td>
+                    <td className="border border-slate-300 px-2 py-1.5 text-right text-slate-700">{roll.quantity_initial} {roll.unit_name || 'm'}</td>
+                    <td className="border border-slate-300 px-2 py-1.5 text-right font-semibold text-blue-600">
                       {Number(roll.quantity_remaining).toFixed(2)} {roll.unit_name || 'm'}
-                    </td>
-                    <td className="px-3 py-2.5 text-center">
-                      <span className="rounded-full bg-emerald-50 px-2 py-1 text-[10px] font-semibold text-emerald-700">{roll.status}</span>
                     </td>
                   </tr>
                 ))}
               </tbody>
             </table>
           </div>
-          <div className="flex flex-col gap-3 border-t border-slate-100 px-4 py-3 text-xs text-slate-600 sm:flex-row sm:items-center sm:justify-between">
-            <span>Trang {page} / {Math.max(totalPages, 1)} · {total.toLocaleString('vi-VN')} cuộn</span>
-            <div className="flex items-center justify-end gap-2">
-              <button type="button" onClick={() => changePage(Math.max(1, page - 1))} disabled={fetching || page <= 1} className="inline-flex items-center gap-1 rounded-lg border border-slate-200 px-3 py-1.5 disabled:opacity-50">
-                <ChevronLeft className="h-4 w-4" /> Trước
-              </button>
-              <button type="button" onClick={() => changePage(page + 1)} disabled={fetching || page >= totalPages} className="inline-flex items-center gap-1 rounded-lg border border-slate-200 px-3 py-1.5 disabled:opacity-50">
-                Sau <ChevronRight className="h-4 w-4" />
-              </button>
-            </div>
-          </div>
         </section>
       )}
-      {viewMode !== 'entry' && tableSelection === 'history' && (
-        <section className="flex h-full min-w-0 flex-col overflow-hidden rounded-2xl border border-slate-200 bg-white shadow-xs">
-          <div className="flex flex-col gap-3 border-b border-slate-100 p-4 sm:flex-row sm:items-center sm:justify-between">
-            <div className="flex items-center gap-3">
-              <History className="h-5 w-5 shrink-0 text-blue-600" />
-              <div ref={tableMenuRef} className="relative">
+      {tableSelection === 'history' && (
+        <section className="order-1 flex h-full min-w-0 flex-col overflow-hidden border border-slate-400 bg-white shadow-sm">
+          <div className="flex flex-col gap-2 border-b border-slate-400 bg-gradient-to-b from-white to-slate-200 px-2 py-1.5 sm:flex-row sm:items-center sm:justify-between">
+            <div className="min-w-0">
+              <div role="tablist" aria-label="Bảng xuất kho" className="flex flex-nowrap items-end gap-1">
                 <button
                   type="button"
-                  aria-haspopup="listbox"
-                  aria-expanded={tableMenuOpen}
-                  aria-label={`Bảng đang xem: Lịch sử xuất kho (${historyTotal.toLocaleString('vi-VN')}). Chọn bảng`}
-                  onClick={() => setTableMenuOpen((open) => !open)}
-                  className="inline-flex max-w-full items-center gap-2 rounded-md py-1 text-left text-base font-semibold text-slate-900 transition-colors hover:text-blue-700 focus-visible:outline-hidden focus-visible:ring-2 focus-visible:ring-blue-500"
+                  role="tab"
+                  aria-selected={false}
+                  onClick={() => { setTableSelection('inventory'); setSelectedHistoryTransId(null); setSelectedInventoryRollId(null); }}
+                  className="shrink-0 border border-slate-300 bg-slate-200 px-2.5 py-1.5 text-[11px] text-slate-700 hover:bg-slate-100 focus-visible:outline-hidden focus-visible:ring-2 focus-visible:ring-blue-500"
                 >
-                  <span className="truncate">Lịch sử xuất kho ({historyTotal.toLocaleString('vi-VN')})</span>
-                  <ChevronDown className={`h-4 w-4 shrink-0 text-slate-500 transition-transform ${tableMenuOpen ? 'rotate-180' : ''}`} />
+                  Tồn kho có thể xuất ({total.toLocaleString('vi-VN')})
                 </button>
-                {tableMenuOpen && (
-                  <div role="listbox" aria-label="Chọn bảng hiển thị" className="absolute left-0 top-full z-30 mt-2 min-w-56 overflow-hidden rounded-xl border border-slate-200 bg-white p-1.5 shadow-lg">
-                    <button type="button" role="option" aria-selected={false} onClick={() => { setTableSelection('inventory'); setTableMenuOpen(false); }} className="flex w-full items-center gap-2.5 rounded-lg px-3 py-2.5 text-left text-sm text-slate-700 hover:bg-slate-50">
-                      <Table2 className="h-4 w-4 shrink-0" /> Tồn kho có thể xuất ({total.toLocaleString('vi-VN')} cuộn)
-                    </button>
-                    <button type="button" role="option" aria-selected onClick={() => { setTableSelection('history'); setTableMenuOpen(false); }} className="flex w-full items-center gap-2.5 rounded-lg bg-blue-50 px-3 py-2.5 text-left text-sm font-semibold text-blue-700">
-                      <History className="h-4 w-4 shrink-0" /> Lịch sử xuất kho
-                    </button>
-                  </div>
-                )}
-                <p className="mt-1 text-xs text-slate-500">Các cuộn đã xuất và thông tin phiếu lãnh</p>
+                <button
+                  type="button"
+                  role="tab"
+                  aria-selected={tableSelection === 'history'}
+                  onClick={() => { setTableSelection('history'); setSelectedInventoryRollId(null); }}
+                  className={`shrink-0 border px-2.5 py-1.5 text-[11px] focus-visible:outline-hidden focus-visible:ring-2 focus-visible:ring-blue-500 ${
+                    tableSelection === 'history'
+                      ? 'relative z-10 -mb-px border-slate-400 border-b-white bg-white font-semibold text-slate-900'
+                      : 'border-slate-300 bg-slate-200 text-slate-700 hover:bg-slate-100'
+                  }`}
+                >
+                  Lịch sử xuất kho ({historyTotal.toLocaleString('vi-VN')})
+                </button>
               </div>
+              <p className="mt-1 text-[10px] text-slate-600">Các cuộn đã xuất và thông tin phiếu lãnh</p>
             </div>
-            <div className="flex min-w-0 flex-col gap-2 sm:flex-row">
+            <div className="flex min-w-0 items-center gap-1.5">
               <div className="relative min-w-0 flex-1">
-                <Search className="absolute left-2.5 top-1/2 h-3.5 w-3.5 -translate-y-1/2 text-slate-400" />
+                <Search className="absolute left-2 top-1/2 h-3.5 w-3.5 -translate-y-1/2 text-slate-400" />
                 <input
                   value={historySearch}
                   onChange={(event) => setHistorySearch(event.target.value)}
                   onKeyDown={(event) => event.key === 'Enter' && searchExportHistory()}
-                  placeholder="Tìm mã cuộn, tên vải, ghi chú..."
-                  className="w-full rounded-lg border border-slate-200 py-2 pl-8 pr-2 text-xs"
+                  placeholder="Tìm cuộn đã xuất..."
+                  aria-label="Tìm lịch sử xuất kho"
+                  className="h-7 w-full min-w-0 border border-slate-400 bg-white pl-7 pr-2 text-[11px] text-slate-900 shadow-inner focus:border-blue-600 focus:outline-hidden focus:ring-1 focus:ring-blue-500"
                 />
               </div>
-              <button type="button" onClick={searchExportHistory} disabled={historyLoading} className="rounded-lg border border-slate-200 px-3 py-2 text-xs font-medium disabled:opacity-50">Tìm</button>
-              <button type="button" onClick={() => void fetchExportHistory()} disabled={historyLoading} className="inline-flex shrink-0 items-center gap-2 rounded-lg border border-slate-200 px-3 py-2 text-xs font-medium disabled:opacity-50">
+              <button type="button" onClick={searchExportHistory} disabled={historyLoading} className="h-7 shrink-0 border border-slate-400 bg-gradient-to-b from-white to-slate-200 px-2 text-[11px] font-semibold text-slate-800 disabled:opacity-50">Tìm</button>
+              <button type="button" onClick={() => void fetchExportHistory()} disabled={historyLoading} className="inline-flex h-7 shrink-0 items-center gap-1 border border-slate-400 bg-gradient-to-b from-white to-slate-200 px-2 text-[11px] font-semibold text-slate-800 disabled:opacity-50">
                 <RefreshCw className={`h-3.5 w-3.5 ${historyLoading ? 'animate-spin' : ''}`} /> Làm mới
               </button>
             </div>
           </div>
-          <div className="max-h-[65vh] overflow-auto">
-            <table className="w-full min-w-[760px] text-left text-xs">
-              <thead className="sticky top-0 z-10 border-b border-slate-200 bg-slate-50 text-[11px] font-semibold uppercase text-slate-600">
+          <div className="max-h-[54vh] flex-1 overflow-auto">
+            <table className="w-full min-w-[700px] border-collapse text-left text-[11px]">
+              <thead className="sticky top-0 z-10 bg-gradient-to-b from-slate-100 to-slate-300 text-[10px] font-semibold uppercase text-slate-700">
                 <tr>
-                  <th className="px-3 py-3">Mã phiếu / giao dịch</th>
-                  <th className="px-3 py-3">Khách hàng</th>
-                  <th className="px-3 py-3">Mã cuộn / vải</th>
-                  <th className="px-3 py-3 text-right">Số lượng</th>
-                  <th className="px-3 py-3">Ghi chú</th>
-                  <th className="px-3 py-3 text-center">Ngày xuất</th>
-                  <th className="px-3 py-3 text-right">Sửa</th>
+                  <th className="border border-slate-400 px-1 py-1.5">Mã phiếu / giao dịch</th>
+                  <th className="border border-slate-400 px-1 py-1.5">Khách hàng</th>
+                  <th className="border border-slate-400 px-1 py-1.5">Mã cuộn / vải</th>
+                  <th className="border border-slate-400 px-1 py-1.5 text-right">Số lượng</th>
+                  <th className="border border-slate-400 px-1 py-1.5">Ghi chú</th>
+                  <th className="border border-slate-400 px-1 py-1.5 text-center">Ngày xuất</th>
+                  <th className="border border-slate-400 px-1 py-1.5 text-center">Sửa</th>
                 </tr>
               </thead>
-              <tbody className="divide-y divide-slate-100">
+              <tbody>
                 {historyLoading ? (
-                  <tr><td colSpan={7} className="py-10 text-center text-slate-400">Đang tải lịch sử xuất kho...</td></tr>
+                  <tr><td colSpan={7} className="border border-slate-300 py-8 text-center text-slate-500">Đang tải lịch sử xuất kho...</td></tr>
                 ) : exportHistory.length === 0 ? (
-                  <tr><td colSpan={7} className="py-10 text-center text-slate-400">Chưa có lịch sử xuất kho khớp với tìm kiếm.</td></tr>
-                ) : exportHistory.map((item) => (
-                  <tr key={item.trans_id} className="hover:bg-slate-50">
-                    <td className="px-3 py-2.5">
+                  <tr><td colSpan={7} className="border border-slate-300 py-8 text-center text-slate-500">Chưa có lịch sử xuất kho khớp với tìm kiếm.</td></tr>
+                ) : exportHistory.map((item, index) => (
+                  <tr
+                    key={item.trans_id}
+                    onClick={() => {
+                      setSelectedHistoryTransId(item.trans_id);
+                      setSelectedInventoryRollId(null);
+                    }}
+                    onKeyDown={(event) => {
+                      if (event.key === 'Enter' || event.key === ' ') {
+                        event.preventDefault();
+                        setSelectedHistoryTransId(item.trans_id);
+                        setSelectedInventoryRollId(null);
+                      }
+                    }}
+                    tabIndex={0}
+                    aria-selected={selectedHistoryTransId === item.trans_id}
+                    aria-label={`Chọn giao dịch xuất ${item.order_code || item.trans_id} cuộn ${item.roll_code}`}
+                    className={`cursor-pointer focus:outline-hidden focus:ring-2 focus:ring-inset focus:ring-blue-500 ${
+                      selectedHistoryTransId === item.trans_id
+                        ? 'bg-[#dbeafe]'
+                        : index % 2 === 0 ? 'bg-white hover:bg-slate-50' : 'bg-[#f7f7f7] hover:bg-slate-50'
+                    }`}
+                  >
+                    <td className="border border-slate-300 px-2 py-1.5">
                       <div className="font-semibold text-slate-900">{item.order_code || `GD #${item.trans_id}`}</div>
-                      <div className="text-[10px] text-slate-400">#{item.trans_id}</div>
+                      <div className="text-[10px] text-slate-500">#{item.trans_id}</div>
                     </td>
-                    <td className="px-3 py-2.5 text-slate-700">{item.customer_name || '-'}</td>
-                    <td className="px-3 py-2.5">
+                    <td className="border border-slate-300 px-2 py-1.5 text-slate-700">{item.customer_name || '-'}</td>
+                    <td className="border border-slate-300 px-2 py-1.5">
                       <div className="font-semibold text-blue-600">{item.roll_code}</div>
                       <div className="text-slate-500">{item.fabric_name}</div>
                     </td>
-                    <td className="px-3 py-2.5 text-right font-semibold text-slate-800">{Number(item.quantity).toFixed(2)} m</td>
-                    <td className="max-w-xs truncate px-3 py-2.5 text-slate-500" title={item.note || ''}>{item.note || '-'}</td>
-                    <td className="px-3 py-2.5 text-center text-slate-500">{new Date(item.transaction_date).toLocaleDateString('vi-VN')}</td>
-                    <td className="px-3 py-2.5 text-right">
-                      <button type="button" onClick={() => startEditingHistory(item)} title="Sửa giao dịch xuất" className="rounded-lg p-2 text-blue-600 hover:bg-blue-50">
-                        <Pencil className="h-4 w-4" />
+                    <td className="border border-slate-300 px-2 py-1.5 text-right font-semibold text-slate-800">{Number(item.quantity).toFixed(2)} m</td>
+                    <td className="max-w-xs truncate border border-slate-300 px-2 py-1.5 text-slate-600" title={item.note || ''}>{item.note || '-'}</td>
+                    <td className="border border-slate-300 px-2 py-1.5 text-center text-slate-600">{new Date(item.transaction_date).toLocaleDateString('vi-VN')}</td>
+                    <td className="border border-slate-300 px-1 py-1 text-center">
+                      <button type="button" onClick={(event) => { event.stopPropagation(); startEditingHistory(item); }} title="Sửa giao dịch xuất" aria-label={`Sửa giao dịch ${item.trans_id}`} className="text-blue-600 hover:text-blue-800">
+                        <Pencil className="mx-auto h-4 w-4" />
                       </button>
                     </td>
                   </tr>
                 ))}
               </tbody>
             </table>
-          </div>
-          <div className="flex flex-col gap-3 border-t border-slate-100 px-4 py-3 text-xs text-slate-600 sm:flex-row sm:items-center sm:justify-between">
-            <span>Trang {historyPage} / {Math.max(historyTotalPages, 1)} · {historyTotal.toLocaleString('vi-VN')} giao dịch xuất</span>
-            <div className="flex justify-end gap-2">
-              <button type="button" onClick={() => { const next = Math.max(1, historyPage - 1); setHistoryPage(next); void fetchExportHistory(next); }} disabled={historyLoading || historyPage <= 1} className="inline-flex items-center gap-1 rounded-lg border border-slate-200 px-3 py-1.5 disabled:opacity-50">
-                <ChevronLeft className="h-4 w-4" /> Trước
-              </button>
-              <button type="button" onClick={() => { const next = historyPage + 1; setHistoryPage(next); void fetchExportHistory(next); }} disabled={historyLoading || historyPage >= historyTotalPages} className="inline-flex items-center gap-1 rounded-lg border border-slate-200 px-3 py-1.5 disabled:opacity-50">
-                Sau <ChevronRight className="h-4 w-4" />
-              </button>
-            </div>
           </div>
         </section>
       )}
@@ -708,6 +970,37 @@ export default function ExportPage() {
               </div>
             </form>
           </div>
+        )}
+        {editingNoteIndex !== null && noteEditorPosition && typeof document !== 'undefined' && createPortal(
+          <div
+            ref={noteEditorRef}
+            className="fixed z-[1100] rounded-md border border-blue-500 bg-white p-2 shadow-xl"
+            style={{
+              top: noteEditorPosition.top,
+              left: noteEditorPosition.left,
+              width: noteEditorPosition.width,
+            }}
+          >
+            <div className="mb-1 text-xs font-semibold text-slate-700">
+              Ghi chú dòng {editingNoteIndex + 1}
+            </div>
+            <textarea
+              ref={noteTextareaRef}
+              aria-label={`Nội dung ghi chú dòng ${editingNoteIndex + 1}`}
+              value={rows[editingNoteIndex]?.note ?? ''}
+              onChange={(event) => handleChangeRow(editingNoteIndex, 'note', event.target.value)}
+              onBlur={() => {
+                window.setTimeout(() => {
+                  if (!noteEditorRef.current?.contains(document.activeElement)) {
+                    setEditingNoteIndex(null);
+                  }
+                }, 0);
+              }}
+              rows={5}
+              className="w-full resize-y rounded border border-slate-300 px-2 py-1.5 text-sm leading-5 text-slate-900 focus:border-blue-500 focus:outline-hidden focus:ring-1 focus:ring-blue-500"
+            />
+          </div>,
+          document.body,
         )}
     </div>
   );

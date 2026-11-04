@@ -1,6 +1,7 @@
 'use client';
 
 import { useEffect, useId, useMemo, useRef, useState } from 'react';
+import { createPortal } from 'react-dom';
 import { Check, ChevronDown, Search, X } from 'lucide-react';
 
 export interface SearchableComboboxOption {
@@ -26,6 +27,8 @@ interface SearchableComboboxProps {
   required?: boolean;
   ariaLabel: string;
   className?: string;
+  showSearchIcon?: boolean;
+  showChevron?: boolean;
 }
 
 export default function SearchableCombobox({
@@ -39,6 +42,8 @@ export default function SearchableCombobox({
   required = false,
   ariaLabel,
   className = '',
+  showSearchIcon = true,
+  showChevron = true,
 }: SearchableComboboxProps) {
   const generatedId = useId();
   const inputId = `searchable-combobox-${generatedId}`;
@@ -53,6 +58,13 @@ export default function SearchableCombobox({
   const [createError, setCreateError] = useState('');
   const [createValues, setCreateValues] = useState<Record<string, string>>({});
   const [createdOption, setCreatedOption] = useState<SearchableComboboxOption | null>(null);
+  const [menuPosition, setMenuPosition] = useState<{
+    left: number;
+    top: number;
+    width: number;
+    maxHeight: number;
+    opensAbove: boolean;
+  } | null>(null);
 
   useEffect(() => {
     if (!onQueryChange || !open || creating) return;
@@ -74,6 +86,37 @@ export default function SearchableCombobox({
     return availableOptions.filter((option) => option.label.toLocaleLowerCase().includes(normalizedQuery));
   }, [availableOptions, onQueryChange, query]);
   const hasExactOption = availableOptions.some((option) => option.label.trim().toLocaleLowerCase() === query.trim().toLocaleLowerCase());
+
+  const updateMenuPosition = () => {
+    const bounds = inputRef.current?.getBoundingClientRect();
+    if (!bounds) return;
+
+    const spaceBelow = window.innerHeight - bounds.bottom - 8;
+    const spaceAbove = bounds.top - 8;
+    const opensAbove = spaceBelow < 160 && spaceAbove > spaceBelow;
+    const maxHeight = Math.max(0, Math.min(240, opensAbove ? spaceAbove : spaceBelow));
+    const width = Math.min(bounds.width, window.innerWidth - 16);
+    const left = Math.max(8, Math.min(bounds.left, window.innerWidth - width - 8));
+
+    setMenuPosition({
+      left,
+      top: opensAbove ? bounds.top - 4 : bounds.bottom + 4,
+      width,
+      maxHeight,
+      opensAbove,
+    });
+  };
+
+  useEffect(() => {
+    if (!open) return;
+
+    window.addEventListener('scroll', updateMenuPosition, true);
+    window.addEventListener('resize', updateMenuPosition);
+    return () => {
+      window.removeEventListener('scroll', updateMenuPosition, true);
+      window.removeEventListener('resize', updateMenuPosition);
+    };
+  }, [open]);
 
   const selectOption = (option: SearchableComboboxOption) => {
     onChange(option.value);
@@ -110,7 +153,9 @@ export default function SearchableCombobox({
   return (
     <div ref={containerRef} className="relative min-w-0">
       <div className="relative">
-        <Search className="pointer-events-none absolute left-3 top-1/2 h-4 w-4 -translate-y-1/2 text-slate-400" />
+        {showSearchIcon && (
+          <Search className="pointer-events-none absolute left-3 top-1/2 h-4 w-4 -translate-y-1/2 text-slate-400" />
+        )}
         <input
           ref={inputRef}
           id={inputId}
@@ -125,9 +170,11 @@ export default function SearchableCombobox({
           required={required}
           value={open ? query : selectedOption?.label || ''}
           placeholder={placeholder}
-          className={`w-full rounded-lg border border-slate-300 bg-white py-2 pl-9 pr-9 text-sm text-slate-900 focus:border-blue-500 focus:outline-hidden focus:ring-2 focus:ring-blue-100 ${className}`}
+          title={selectedOption?.label || placeholder}
+          className={`w-full rounded-lg border border-slate-300 bg-white py-2 ${showSearchIcon ? 'pl-9' : 'pl-3'} ${showChevron ? 'pr-9' : value ? 'pr-7' : 'pr-3'} text-sm text-slate-900 focus:border-blue-500 focus:outline-hidden focus:ring-2 focus:ring-blue-100 ${className}`}
           onFocus={(event) => {
             setQuery(selectedOption?.label || '');
+            updateMenuPosition();
             setOpen(true);
             setActiveIndex(0);
             event.currentTarget.select();
@@ -181,101 +228,123 @@ export default function SearchableCombobox({
               setQuery('');
               inputRef.current?.setCustomValidity(required ? 'Chọn một mục trong danh sách.' : '');
             }}
-            className="absolute right-8 top-1/2 -translate-y-1/2 rounded p-0.5 text-slate-400 hover:bg-slate-100 hover:text-slate-700"
+            className={`absolute ${showChevron ? 'right-8' : 'right-1'} top-1/2 -translate-y-1/2 rounded p-0.5 text-slate-400 hover:bg-slate-100 hover:text-slate-700`}
           >
             <X className="h-4 w-4" />
           </button>
         ) : null}
-        <ChevronDown className={`pointer-events-none absolute right-3 top-1/2 h-4 w-4 -translate-y-1/2 text-slate-400 transition-transform ${open ? 'rotate-180' : ''}`} />
+        {showChevron && (
+          <ChevronDown className={`pointer-events-none absolute right-3 top-1/2 h-4 w-4 -translate-y-1/2 text-slate-400 transition-transform ${open ? 'rotate-180' : ''}`} />
+        )}
       </div>
-      {open && !creating && (
-        <ul
-          id={listId}
-          role="listbox"
-          aria-label={ariaLabel}
-          className="absolute z-50 mt-1 max-h-60 w-full overflow-y-auto rounded-lg border border-slate-200 bg-white p-1 shadow-lg"
-        >
-          {filteredOptions.length === 0 ? (
-            <li className="px-3 py-2 text-sm text-slate-500">Không tìm thấy mục phù hợp.</li>
-          ) : filteredOptions.map((option, index) => (
-            <li key={option.value} id={`${listId}-${index}`} role="option" aria-selected={option.value === value}>
-              <button
-                type="button"
-                className={`flex w-full items-center justify-between gap-2 rounded-md px-3 py-2 text-left text-sm ${
-                  index === activeIndex ? 'bg-blue-50 text-blue-700' : 'text-slate-700 hover:bg-slate-50'
-                }`}
-                onMouseDown={(event) => event.preventDefault()}
-                onMouseEnter={() => setActiveIndex(index)}
-                onClick={() => selectOption(option)}
-              >
-                <span className="truncate">{option.label}</span>
-                {option.value === value && <Check className="h-4 w-4 shrink-0 text-blue-600" />}
-              </button>
-            </li>
-          ))}
-        </ul>
-      )}
-      {open && onCreateOption && query.trim() && !hasExactOption && (
-        <div className="absolute z-[60] mt-1 w-full rounded-lg border border-slate-200 bg-white p-3 shadow-lg">
-          {!creating ? (
-            <button
-              type="button"
-              onMouseDown={(event) => event.preventDefault()}
-              onClick={() => setCreating(true)}
-              className="w-full rounded-md px-3 py-2 text-left text-sm font-medium text-blue-700 hover:bg-blue-50"
+      {open && menuPosition && typeof document !== 'undefined' && createPortal(
+        <>
+          {!creating && (
+            <ul
+              id={listId}
+              role="listbox"
+              aria-label={ariaLabel}
+              className={`fixed z-[1000] overflow-y-auto rounded-lg border border-slate-200 bg-white p-1 shadow-lg ${menuPosition.opensAbove ? '-translate-y-full' : ''}`}
+              style={{
+                left: menuPosition.left,
+                top: menuPosition.top,
+                width: menuPosition.width,
+                maxHeight: menuPosition.maxHeight,
+              }}
             >
-              + Thêm “{query.trim()}” vào danh mục
-            </button>
-          ) : (
-            <div className="space-y-3">
-              <p className="text-sm font-semibold text-slate-800">Thêm mục mới: {query.trim()}</p>
-              {createFields?.map((field) => (
-                <label key={field.name} className="block space-y-1 text-xs font-semibold text-slate-700">
-                  {field.label}
-                  {field.options ? (
-                    <select
-                      required={field.required}
-                      value={createValues[field.name] || ''}
-                      onChange={(event) => setCreateValues((values) => ({ ...values, [field.name]: event.target.value }))}
-                      className="w-full rounded-lg border border-slate-200 bg-white px-3 py-2 text-sm font-normal"
-                    >
-                      <option value="">Chọn {field.label.toLowerCase()}</option>
-                      {field.options.map((option) => (
-                        <option key={option.value} value={option.value}>{option.label}</option>
-                      ))}
-                    </select>
-                  ) : (
-                    <input
-                      required={field.required}
-                      value={createValues[field.name] || ''}
-                      onChange={(event) => setCreateValues((values) => ({ ...values, [field.name]: event.target.value }))}
-                      className="w-full rounded-lg border border-slate-200 px-3 py-2 text-sm font-normal"
-                    />
-                  )}
-                </label>
+              {filteredOptions.length === 0 ? (
+                <li className="px-3 py-2 text-sm text-slate-500">Không tìm thấy mục phù hợp.</li>
+              ) : filteredOptions.map((option, index) => (
+                <li key={option.value} id={`${listId}-${index}`} role="option" aria-selected={option.value === value}>
+                  <button
+                    type="button"
+                    className={`flex w-full items-center justify-between gap-2 rounded-md px-3 py-2 text-left text-sm ${
+                      index === activeIndex ? 'bg-blue-50 text-blue-700' : 'text-slate-700 hover:bg-slate-50'
+                    }`}
+                    onMouseDown={(event) => event.preventDefault()}
+                    onMouseEnter={() => setActiveIndex(index)}
+                    onClick={() => selectOption(option)}
+                  >
+                    <span className="truncate">{option.label}</span>
+                    {option.value === value && <Check className="h-4 w-4 shrink-0 text-blue-600" />}
+                  </button>
+                </li>
               ))}
-              {createError && <p role="alert" className="text-xs text-rose-700">{createError}</p>}
-              <div className="flex justify-end gap-2">
+            </ul>
+          )}
+          {onCreateOption && query.trim() && !hasExactOption && (
+            <div
+              className={`fixed z-[1000] rounded-lg border border-slate-200 bg-white p-3 shadow-lg ${menuPosition.opensAbove ? '-translate-y-full' : ''}`}
+              style={{
+                left: menuPosition.left,
+                top: menuPosition.top,
+                width: menuPosition.width,
+                maxHeight: menuPosition.maxHeight,
+                overflowY: 'auto',
+              }}
+            >
+              {!creating ? (
                 <button
                   type="button"
-                  disabled={savingNewOption}
-                  onClick={() => { setCreating(false); setCreateError(''); }}
-                  className="rounded-md border border-slate-200 px-3 py-1.5 text-xs text-slate-700 disabled:opacity-50"
+                  onMouseDown={(event) => event.preventDefault()}
+                  onClick={() => setCreating(true)}
+                  className="w-full rounded-md px-3 py-2 text-left text-sm font-medium text-blue-700 hover:bg-blue-50"
                 >
-                  Hủy
+                  + Thêm “{query.trim()}” vào danh mục
                 </button>
-                <button
-                  type="button"
-                  onClick={() => void createOption()}
-                  disabled={savingNewOption}
-                  className="rounded-md bg-blue-600 px-3 py-1.5 text-xs font-semibold text-white disabled:opacity-50"
-                >
-                  {savingNewOption ? 'Đang thêm...' : 'Tạo và chọn'}
-                </button>
-              </div>
+              ) : (
+                <div className="space-y-3">
+                  <p className="text-sm font-semibold text-slate-800">Thêm mục mới: {query.trim()}</p>
+                  {createFields?.map((field) => (
+                    <label key={field.name} className="block space-y-1 text-xs font-semibold text-slate-700">
+                      {field.label}
+                      {field.options ? (
+                        <select
+                          required={field.required}
+                          value={createValues[field.name] || ''}
+                          onChange={(event) => setCreateValues((values) => ({ ...values, [field.name]: event.target.value }))}
+                          className="w-full rounded-lg border border-slate-200 bg-white px-3 py-2 text-sm font-normal"
+                        >
+                          <option value="">Chọn {field.label.toLowerCase()}</option>
+                          {field.options.map((option) => (
+                            <option key={option.value} value={option.value}>{option.label}</option>
+                          ))}
+                        </select>
+                      ) : (
+                        <input
+                          required={field.required}
+                          value={createValues[field.name] || ''}
+                          onChange={(event) => setCreateValues((values) => ({ ...values, [field.name]: event.target.value }))}
+                          className="w-full rounded-lg border border-slate-200 px-3 py-2 text-sm font-normal"
+                        />
+                      )}
+                    </label>
+                  ))}
+                  {createError && <p role="alert" className="text-xs text-rose-700">{createError}</p>}
+                  <div className="flex justify-end gap-2">
+                    <button
+                      type="button"
+                      disabled={savingNewOption}
+                      onClick={() => { setCreating(false); setCreateError(''); }}
+                      className="rounded-md border border-slate-200 px-3 py-1.5 text-xs text-slate-700 disabled:opacity-50"
+                    >
+                      Hủy
+                    </button>
+                    <button
+                      type="button"
+                      onClick={() => void createOption()}
+                      disabled={savingNewOption}
+                      className="rounded-md bg-blue-600 px-3 py-1.5 text-xs font-semibold text-white disabled:opacity-50"
+                    >
+                      {savingNewOption ? 'Đang thêm...' : 'Tạo và chọn'}
+                    </button>
+                  </div>
+                </div>
+              )}
             </div>
           )}
-        </div>
+        </>,
+        document.body
       )}
     </div>
   );

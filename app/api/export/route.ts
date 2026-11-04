@@ -8,6 +8,7 @@ export async function POST(request: Request) {
   try {
     const body = await request.json();
     const { items, note, customer_id } = body;
+    const orderNote = typeof note === 'string' ? note.trim() || null : null;
 
     const customerId = Number(customer_id);
     if (!Array.isArray(items) || items.length === 0 || !Number.isSafeInteger(customerId) || customerId <= 0) {
@@ -32,6 +33,9 @@ export async function POST(request: Request) {
 
     for (let i = 0; i < items.length; i++) {
       const { roll_id, export_quantity } = items[i];
+      const itemNote = typeof items[i].note === 'string'
+        ? items[i].note.trim() || null
+        : orderNote;
       const qty = parseFloat(export_quantity);
 
       if (!Number.isSafeInteger(Number(roll_id)) || Number(roll_id) <= 0 || !Number.isFinite(qty) || qty <= 0) {
@@ -75,13 +79,13 @@ export async function POST(request: Request) {
           qty,
           currentRoll.location_id || null,
           orderResult.insertId,
-          note || `Xuất kho hàng loạt cuộn ${currentRoll.roll_code}`,
+          itemNote || `Xuất kho hàng loạt cuộn ${currentRoll.roll_code}`,
         ]
       );
       await connection.query(
         `INSERT INTO export_details (export_id, roll_id, quantity, note)
          VALUES (?, ?, ?, ?)`,
-        [orderResult.insertId, roll_id, qty, typeof note === 'string' ? note.trim() || null : null]
+        [orderResult.insertId, roll_id, qty, itemNote]
       );
     }
 

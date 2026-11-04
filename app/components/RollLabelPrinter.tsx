@@ -35,6 +35,7 @@ export default function RollLabelPrinter({ labels, onClose }: { labels: RollLabe
   const [height, setHeight] = useState(5);
   const [qrSources, setQrSources] = useState<Record<string, string>>({});
   const [error, setError] = useState('');
+  const [barcodeReady, setBarcodeReady] = useState(false);
   const firstLabel = labels[0];
 
   useEffect(() => {
@@ -47,9 +48,11 @@ export default function RollLabelPrinter({ labels, onClose }: { labels: RollLabe
           const barcode = svg.dataset.value;
           if (barcode) JsBarcode(svg, barcode, { format: 'CODE128', displayValue: true, height: 48, margin: 4 });
         });
+        setBarcodeReady(true);
       }).catch((caught: unknown) => {
         console.error('Lỗi tạo barcode:', caught);
         setError('Không thể tạo barcode cho mã này.');
+        setBarcodeReady(false);
       });
     } else if (format === 'qr') {
       Promise.all(labels.map((label) => QRCode.toDataURL(label.barcode, { width: 160, margin: 1 })
@@ -69,7 +72,9 @@ export default function RollLabelPrinter({ labels, onClose }: { labels: RollLabe
       ? current.filter((item) => item !== field)
       : [...current, field]);
   };
-  const labelsReady = format === 'barcode' || labels.every((label) => Boolean(qrSources[label.barcode]));
+  const labelsReady = format === 'barcode'
+    ? barcodeReady
+    : labels.every((label) => Boolean(qrSources[label.barcode]));
 
   return (
     <div className="fixed inset-0 z-50 flex items-center justify-center overflow-y-auto bg-slate-950/50 p-4">
@@ -91,7 +96,7 @@ export default function RollLabelPrinter({ labels, onClose }: { labels: RollLabe
       <div className="grid gap-4 lg:grid-cols-[minmax(0,1fr)_320px]">
         <div className="space-y-3">
           <div className="flex flex-wrap gap-3 text-sm">
-            <label className="flex items-center gap-2"><input type="radio" checked={format === 'barcode'} onChange={() => { setError(''); setFormat('barcode'); }} /> Barcode</label>
+            <label className="flex items-center gap-2"><input type="radio" checked={format === 'barcode'} onChange={() => { setError(''); setBarcodeReady(false); setFormat('barcode'); }} /> Barcode</label>
             <label className="flex items-center gap-2"><input type="radio" checked={format === 'qr'} onChange={() => { setError(''); setFormat('qr'); }} /> QR code</label>
           </div>
           <div className="grid grid-cols-2 gap-3">
